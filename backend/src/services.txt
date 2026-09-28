@@ -1,0 +1,534 @@
+
+================================================================================
+FILE: auth-service.ts
+================================================================================
+// backend/src/services/auth-service.ts
+// Login, register, 2FA, password reset
+// Per documentation: backend/src/services/auth-service.ts
+
+import bcrypt from 'bcrypt'
+import jwt from 'jsonwebtoken'
+import { authenticator } from 'otplib'
+import { randomBytes } from 'crypto'
+import redis from '../lib/redis.js'
+import { supabase } from '../lib/supabase.js' 
+import { generateFingerprint, extractFromRequest } from '../lib/security/device-fingerprint.js'
+import { encrypt } from '../lib/encryption.js'
+import { randomInt } from 'crypto';
+
+const JWT_SECRET = process.env.JWT_SECRET!
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '30m'
+const BCRYPT_ROUNDS = 12
+
+export interface LoginCredentials {
+  email: string
+  password: string
+}
+
+export interface RegisterData {
+  email: string
+  password: string
+  role?: 'USER' | 'ADMIN'
+}
+
+export interface SessionData {
+  userId: string
+  deviceFingerprint: string
+  ipAddress: string
+  geoLocation?: { city: string; country: string; lat: number; lon: number }
+  userAgent: string
+}
+
+// Hash password with bcrypt (12 rounds per documentation)
+export async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, BCRYPT_ROUNDS)
+}
+
+// Verify password
+export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(password, hash)
+}
+
+// Generate JWT token
+export function generateToken(payload: object): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN })
+}
+
+// Verify JWT token
+export function verifyToken(token: string): any {
+  return jwt.verify(token, JWT_SECRET)
+}
+
+// Generate 2FA TOTP secret
+export function generate2FASecret(): string {
+  return authenticator.generateSecret()
+}
+
+// Verify 2FA TOTP code
+export function verify2FAToken(token: string, secret: string): boolean {
+  return authenticator.verify({ token, secret })
+}
+
+// Generate 6-digit 2FA code (for email)
+export function generate2FACode(): string {
+  return randomInt(100000, 999999).toString().padStart(6, '0');
+}
+
+// Store 2FA code in Redis (5 min expiry)
+export async function store2FACode(sessionId: string, code: string): Promise<void> {
+  await redis.setex(`2fa:${sessionId}`, 300, code) // 5 minutes
+}
+
+// Verify 2FA code from Redis
+export async function verify2FACode(sessionId: string, code: string): Promise<boolean> {
+  const stored = await redis.get(`2fa:${sessionId}`)
+  if (!stored) return false
+  
+  const valid = stored === code
+  if (valid) {
+    await redis.del(`2fa:${sessionId}`) // Delete after use
+  }
+  return valid
+}
+
+// Create session in database
+export async function createSession(data: SessionData & { expiresAt: Date }): Promise<string> {
+  const { data: session, error } = await supabase
+    .from('Session')
+    .insert({
+      userId: data.userId,
+      deviceFingerprint: data.deviceFingerprint,
+      ipAddress: data.ipAddress,
+      geoLocation: data.geoLocation ? JSON.stringify(data.geoLocation) : null,
+      userAgent: data.userAgent,
+      expiresAt: data.expiresAt.toISOString()
+    })
+    .select('id')
+    .single()
+  
+  if (error) {
+    console.error('Error creating session:', error)
+    throw new Error('Failed to create session')
+  }
+  
+  return session.id
+}
+
+export async function validateSession(sessionId: string, request: any): Promise<boolean> {
+  console.log('[Session Validation] Checking session:', sessionId)
+  
+  const { data: session, error } = await supabase
+    .from('Session')
+    .select(`
+      id,
+      deviceFingerprint,
+      ipAddress,
+      userAgent,
+      expiresAt,
+      user:userId (
+        id,
+        email,
+        role,
+        twoFactorEnabled
+      )
+    `)
+    .eq('id', sessionId)
+    .single()
+  
+  if (error || !session) {
+    console.log('[Session Validation] Session not found or error:', error)
+    return false
+  }
+  
+  if (new Date(session.expiresAt) < new Date()) {
+    console.log('[Session Validation] Session expired')
+    return false
+  }
+  
+  // Extract current request characteristics
+  const currentFingerprint = generateFingerprint(extractFromRequest(request))
+  const currentIP = request.ip || request.headers['x-forwarded-for']
+  const currentUA = request.headers['user-agent']
+  
+  console.log('[Session Validation]', {
+    storedFingerprint: session.deviceFingerprint,
+    currentFingerprint,
+    storedIP: session.ipAddress,
+    currentIP,
+    storedUA: session.userAgent,
+    currentUA
+  })
+  
+  // For admin users: strict validation
+  if (session.user?.role === 'ADMIN') {
+    const checks = {
+      fingerprint: session.deviceFingerprint === currentFingerprint,
+      ip: session.ipAddress === currentIP,
+      userAgent: session.userAgent === currentUA
+    }
+    
+    console.log('[Session Validation] Admin checks:', checks)
+    
+    if (Object.values(checks).includes(false)) {
+      console.log('[Session Validation] FAILED - logging out user')
+      await logoutUser(session.user.id)
+      return false
+    }
+  }
+  
+  console.log('[Session Validation] PASSED')
+  return true
+}
+
+// Login user
+export async function login(credentials: LoginCredentials, req: any): Promise<{ user: any; requires2FA: boolean; sessionId?: string } | null> {
+  const { data: user, error } = await supabase
+    .from('User')
+    .select('*')
+    .eq('email', credentials.email)
+    .single()
+  
+  if (error || !user) return null
+  
+  const validPassword = await verifyPassword(credentials.password, user.passwordHash)
+  if (!validPassword) return null
+  
+  // Check if 2FA required
+  const requires2FA = user.role === 'ADMIN' && await is2FAEnabled(user.id)
+
+  if (requires2FA) {
+    // Generate and store 2FA code
+    const sessionId = randomBytes(16).toString('hex')
+    const code = generate2FACode()
+    await store2FACode(sessionId, code)
+    console.log(`2FA Code for ${user.email}: ${code}`) // Dev only
+    return { 
+      user: { id: user.id, email: user.email, role: user.role }, 
+      requires2FA: true, 
+      sessionId 
+    }
+  }
+  
+  // Create session directly
+  const fingerprint = generateFingerprint(extractFromRequest(req))
+  const sessionId = await createSession({
+    userId: user.id,
+    deviceFingerprint: fingerprint,
+    ipAddress: req.ip,
+    geoLocation: (req as any).geoLocation, 
+    userAgent: req.headers['user-agent'],
+    expiresAt: new Date(Date.now() + 30 * 60 * 1000) // 30 min
+  })
+  
+  // Update last login
+  await supabase
+    .from('User')
+    .update({ lastLoginAt: new Date().toISOString() })
+    .eq('id', user.id)
+  
+  return { user, requires2FA: false, sessionId }
+}
+
+// Check if 2FA is enabled for user
+async function is2FAEnabled(userId: string): Promise<boolean> {
+  try {
+    const { data: user, error } = await supabase
+      .from('User')
+      .select('twoFactorEnabled')
+      .eq('id', userId)
+      .single()
+    
+    if (error || !user) return false
+    return user.twoFactorEnabled || false
+  } catch {
+    return false
+  }
+}
+
+// Check if any admin exists
+export async function adminExists(): Promise<boolean> {
+  const { data: admin, error } = await supabase
+    .from('User')
+    .select('id')
+    .eq('role', 'ADMIN')
+    .limit(1)
+  
+  if (error) return false
+  return admin && admin.length > 0
+}
+
+// Delete user by email (for admin creation cleanup)
+export async function deleteUserByEmail(email: string): Promise<void> {
+  await supabase
+    .from('User')
+    .delete()
+    .eq('email', email)
+}
+
+// Create default admin if none exists
+export async function createDefaultAdmin(): Promise<void> {
+  // Check if any admin exists
+  const { data: existingAdmin, error: checkError } = await supabase
+    .from('User')
+    .select('id')
+    .eq('role', 'ADMIN')
+    .limit(1)
+  
+  if (checkError) {
+    console.error('Error checking for existing admin:', checkError)
+    return
+  }
+  
+  if (existingAdmin && existingAdmin.length > 0) {
+    console.log('✅ Admin already exists, skipping default admin creation')
+    return
+  }
+  
+  console.log('🔧 No admin found. Creating default admin...')
+  
+  // Check if a user with admin email already exists (as USER)
+  const { data: existingUser } = await supabase
+    .from('User')
+    .select('id, role')
+    .eq('email', 'admin@myshow.tn')
+    .single()
+  
+  const passwordHash = await hashPassword('admin123')
+  
+  if (existingUser) {
+    // Upgrade existing user to ADMIN
+    const { error: updateError } = await supabase
+      .from('User')
+      .update({ 
+        role: 'ADMIN',
+        passwordHash: passwordHash,
+        updatedAt: new Date().toISOString()
+      })
+      .eq('email', 'admin@myshow.tn')
+    
+    if (updateError) {
+      console.error('Failed to upgrade user to admin:', updateError)
+      return
+    }
+    
+    console.log('✅ Existing user upgraded to ADMIN: admin@myshow.tn / admin123')
+    console.log('⚠️  Change password immediately after first login!')
+    return
+  }
+  
+  // Create new admin
+  const { error: createError } = await supabase
+    .from('User')
+    .insert({
+      email: 'admin@myshow.tn',
+      passwordHash: passwordHash,
+      role: 'ADMIN',
+      twoFactorEnabled: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    })
+  
+  if (createError) {
+    console.error('Failed to create default admin:', createError)
+    return
+  }
+  
+  console.log('✅ Default admin created: admin@myshow.tn / admin123')
+  console.log('⚠️  Change password immediately after first login!')
+}
+
+// Register user
+export async function register(data: RegisterData): Promise<any> {
+  const { data: existing, error: checkError } = await supabase
+    .from('User')
+    .select('id')
+    .eq('email', data.email)
+    .single()
+  
+  if (existing) {
+    throw new Error('Email already registered')
+  }
+  
+  const passwordHash = await hashPassword(data.password)
+  
+  const { data: user, error } = await supabase
+    .from('User')
+    .insert({
+      email: data.email,
+      passwordHash,
+      role: data.role || 'USER',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    })
+    .select('id, email, role')
+    .single()
+  
+  if (error) {
+    console.error('Error creating user:', error)
+    throw new Error('Failed to create user')
+  }
+  
+  return user
+}
+
+// Logout user (delete all sessions)
+export async function logoutUser(userId: string): Promise<void> {
+  const { error } = await supabase
+    .from('Session')
+    .delete()
+    .eq('userId', userId)
+  
+  if (error) {
+    console.error('Error deleting sessions:', error)
+    throw new Error('Failed to logout user')
+  }
+}
+
+// Check if 2FA should be required
+async function shouldRequire2FA(userId: string, req: any): Promise<boolean> {
+  // New device (no existing session with this fingerprint)
+  const fingerprint = generateFingerprint(extractFromRequest(req))
+  
+  const { data: existingSession } = await supabase
+    .from('Session')
+    .select('id')
+    .eq('userId', userId)
+    .eq('deviceFingerprint', fingerprint)
+    .limit(1)
+    .single()
+  
+  if (!existingSession) return true
+  
+  // Last login > 30 days
+  const { data: user } = await supabase
+    .from('User')
+    .select('lastLoginAt')
+    .eq('id', userId)
+    .single()
+  
+  if (user?.lastLoginAt) {
+    const daysSinceLogin = (Date.now() - new Date(user.lastLoginAt).getTime()) / (1000 * 60 * 60 * 24)
+    if (daysSinceLogin > 30) return true
+  }
+  
+  return false
+}
+================================================================================
+FILE: export-service.ts
+================================================================================
+
+================================================================================
+FILE: notification-service.ts
+================================================================================
+
+================================================================================
+FILE: tailscale-service.ts
+================================================================================
+
+================================================================================
+FILE: token-service.ts
+================================================================================
+import jwt from 'jsonwebtoken'
+import bcrypt from 'bcrypt'
+import { randomBytes } from 'crypto'
+import { supabase } from '../lib/supabase.js'
+
+const JWT_SECRET = process.env.JWT_SECRET!
+const ACCESS_TOKEN_EXPIRY = '15m' // 15 minutes
+const REFRESH_TOKEN_EXPIRY = 7 * 24 * 60 * 60 * 1000 // 7 days
+
+export interface TokenPayload {
+  userId: string
+  email: string
+  role: string
+  sessionId: string
+  tailscaleIP?: string
+}
+
+// Generate access token (short-lived)
+export function generateAccessToken(payload: TokenPayload): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY })
+}
+
+// Generate refresh token (long-lived, one-time use)
+export async function generateRefreshToken(userId: string): Promise<string> {
+  // Generate random token
+  const refreshToken = randomBytes(40).toString('hex')
+  
+  // Hash it for storage (never store raw tokens)
+  const hashedToken = await bcrypt.hash(refreshToken, 10)
+  
+  // Store in database
+  const { error } = await supabase.from('RefreshToken').insert({
+    userId,
+    token: hashedToken,
+    expiresAt: new Date(Date.now() + REFRESH_TOKEN_EXPIRY).toISOString(),
+    createdAt: new Date().toISOString()
+  })
+  
+  if (error) throw error
+  
+  return refreshToken
+}
+
+// Verify and refresh access token
+export async function refreshAccessToken(
+    refreshToken: string, 
+    tailscaleIP?: string
+  ): Promise<{
+  accessToken: string
+  refreshToken: string
+  user: any
+} | null> {
+  // Find all valid refresh tokens for this user
+  const { data: tokens, error } = await supabase
+    .from('RefreshToken')
+    .select('*, user:User(*)')
+    .gte('expiresAt', new Date().toISOString())
+    .is('revokedAt', null)
+  
+  if (error || !tokens?.length) return null
+  
+  // Find matching token (compare with bcrypt)
+  let validToken = null
+  for (const token of tokens) {
+    const isValid = await bcrypt.compare(refreshToken, token.token)
+    if (isValid) {
+      validToken = token
+      break
+    }
+  }
+  
+  if (!validToken) return null
+  
+  // Revoke the used token (one-time use)
+  await supabase
+    .from('RefreshToken')
+    .update({ revokedAt: new Date().toISOString() })
+    .eq('id', validToken.id)
+  
+  // Generate new tokens
+  const payload = {
+    userId: validToken.user.id,
+    email: validToken.user.email,
+    role: validToken.user.role,
+    sessionId: randomBytes(16).toString('hex'),
+    tailscaleIP: tailscaleIP // use passed value
+  }
+  const newAccessToken = generateAccessToken(payload)
+  const newRefreshToken = await generateRefreshToken(validToken.user.id)
+  
+  return {
+    accessToken: newAccessToken,
+    refreshToken: newRefreshToken,
+    user: validToken.user
+  }
+}
+
+// Revoke all refresh tokens for a user (logout)
+export async function revokeAllUserTokens(userId: string): Promise<void> {
+  await supabase
+    .from('RefreshToken')
+    .update({ revokedAt: new Date().toISOString() })
+    .eq('userId', userId)
+}

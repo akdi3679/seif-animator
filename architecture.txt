@@ -1,0 +1,422 @@
+﻿=== backend ===
++-- src/
+|   +-- services/
+|   |   +-- token-service.ts
+|   |   +-- system-metrics.ts
+|   |   +-- visitor-service.ts
+|   |   +-- translation.service.ts
+|   |   +-- backup-service.js
+|   |   +-- auth-service.ts
+|   |   +-- notification-service.ts
+|   |   \-- cal-sync.service.ts
+|   +-- types/
+|   |   \-- express.d.ts
+|   +-- workers/
+|   |   +-- index.ts
+|   |   +-- telegram-worker.ts
+|   |   +-- backup-worker.js
+|   |   \-- email-worker.ts
+|   +-- lib/
+|   |   +-- utils/
+|   |   +-- validators/
+|   |   |   +-- event.ts
+|   |   |   +-- product.ts
+|   |   |   +-- contact.ts
+|   |   |   +-- auth.ts
+|   |   |   \-- booking.ts
+|   |   +-- security/
+|   |   |   +-- device-fingerprint.ts
+|   |   |   +-- request-signature.ts
+|   |   |   +-- audit-logger.ts
+|   |   |   \-- csrf.ts
+|   |   +-- notifications/
+|   |   |   \-- email-templates.ts
+|   |   +-- queue/
+|   |   +-- queue.ts
+|   |   +-- redis.ts
+|   |   +-- fiscal-lock.ts
+|   |   +-- notification.js
+|   |   +-- supabase.ts
+|   |   +-- tailscale.ts
+|   |   +-- seed.ts
+|   |   +-- site-data.ts
+|   |   +-- backup-supabase.ts
+|   |   +-- cloudinary.ts
+|   |   +-- audit.ts
+|   |   +-- auth-cookies.ts
+|   |   +-- feature-flags.ts
+|   |   +-- financial-events.ts
+|   |   +-- cron-registry.ts
+|   |   \-- encryption.ts
+|   +-- middleware/
+|   |   +-- system-load.ts
+|   |   +-- tailscale.ts
+|   |   +-- validate-request.ts
+|   |   +-- rate-limit.ts
+|   |   +-- auth.ts
+|   |   +-- delete-code.ts
+|   |   \-- error-handler.ts
+|   +-- routes/
+|   |   +-- public/
+|   |   |   +-- newsletter.ts
+|   |   |   +-- index.ts
+|   |   |   +-- prebooking-data.ts
+|   |   |   +-- orders.ts
+|   |   |   +-- geo-lookup.ts
+|   |   |   +-- gallery.ts
+|   |   |   +-- hero.ts
+|   |   |   +-- goals.ts
+|   |   |   +-- products.ts
+|   |   |   +-- tailscale-verify.ts
+|   |   |   +-- site-images.ts
+|   |   |   +-- why-choose-us.ts
+|   |   |   +-- terms.ts
+|   |   |   +-- services.ts
+|   |   |   +-- service-types.ts
+|   |   |   +-- site-data.ts
+|   |   |   +-- sign-upload.ts
+|   |   |   +-- booking-status.ts
+|   |   |   +-- booking-init.ts
+|   |   |   +-- brands.ts
+|   |   |   +-- bookings.ts
+|   |   |   +-- admin-schedule.ts
+|   |   |   +-- about.ts
+|   |   |   +-- booking-events.ts
+|   |   |   +-- auth.ts
+|   |   |   +-- calcom-webhook.ts
+|   |   |   +-- events.ts
+|   |   |   +-- contact.ts
+|   |   |   +-- feature-flags.ts
+|   |   |   +-- faq.ts
+|   |   |   +-- challenge.ts
+|   |   |   +-- categories.ts
+|   |   |   +-- contact-subjects.ts
+|   |   |   \-- contact-info.ts
+|   |   \-- admin/
+|   |       +-- schedule.ts
+|   |       +-- profile.ts
+|   |       +-- secret-codes.ts
+|   |       +-- service-types.ts
+|   |       +-- sensitive-config.ts
+|   |       +-- products.ts
+|   |       +-- monitor.ts
+|   |       +-- messages.ts
+|   |       +-- newsletter.ts
+|   |       +-- orders.ts
+|   |       +-- notifications.js
+|   |       +-- services.ts
+|   |       +-- upload.ts
+|   |       +-- translate.ts
+|   |       +-- wallet.ts
+|   |       +-- workers.ts
+|   |       +-- why-choose-us.ts
+|   |       +-- tools.ts
+|   |       +-- site-data.ts
+|   |       +-- settings.ts
+|   |       +-- site-images.ts
+|   |       +-- terms.ts
+|   |       +-- systeme-health.ts
+|   |       +-- contact-info.ts
+|   |       +-- cloudinary.ts
+|   |       +-- contact-subjects.ts
+|   |       +-- dashboard.ts
+|   |       +-- cron.ts
+|   |       +-- challenges.ts
+|   |       +-- auth.ts
+|   |       +-- about.ts
+|   |       +-- bookings.ts
+|   |       +-- categories.ts
+|   |       +-- brands.ts
+|   |       +-- data.ts
+|   |       +-- health.ts
+|   |       +-- goals.ts
+|   |       +-- hero.ts
+|   |       +-- key-figures.ts
+|   |       +-- index.ts
+|   |       +-- gallery-items.ts
+|   |       +-- faq.ts
+|   |       +-- events.ts
+|   |       +-- feature-flags.ts
+|   |       +-- gallery-categories.ts
+|   |       \-- fixed-expenses.ts
+|   +-- routes.txt
+|   +-- server.ts
+|   +-- services.txt
+|   +-- lib.txt
+|   +-- middleware.txt
+|   \-- root.txt
++-- db/
+|   +-- schema.sql
+|   \-- backup-schema.sql
++-- package.json
++-- package-lock.json
++-- test.png
++-- tsconfig.json
++-- test.ts
++-- note.txt
++-- .eslintrc.json
++-- .env
++-- frontend-complete.txt
++-- merged-ts-errors.txt
+\-- merged-error-files.txt
+=== frontend ===
++-- lib/
+|   +-- utils/
+|   |   +-- images.ts
+|   |   +-- translate.ts
+|   |   +-- date.ts
+|   |   +-- constants.ts
+|   |   \-- currency.ts
+|   +-- validations/
+|   +-- api/
+|   |   +-- index.ts
+|   |   +-- rate-limit-cache.ts
+|   |   +-- types.ts
+|   |   +-- client.ts
+|   |   +-- error-handler.ts
+|   |   \-- hooks.ts
+|   +-- hooks/
+|   |   +-- useScrollDirection.ts
+|   |   +-- useTailscaleCheck.ts
+|   |   +-- useWalletData.ts
+|   |   +-- useLineGrowth.ts
+|   |   +-- useCountUp.ts
+|   |   +-- useGeoLocation.ts
+|   |   \-- useInView.ts
+|   +-- getSiteData.ts
+|   +-- utils.ts
+|   +-- cloudinary-upload.ts
+|   \-- getFeatureFlags.ts
++-- public/
+|   +-- locales/
+|   |   +-- fr/
+|   |   |   \-- common.json
+|   |   \-- ar/
+|   |       \-- common.json
+|   +-- animations/
+|   |   \-- balloon-party.json
+|   +-- vercel.svg
+|   +-- window.svg
+|   +-- next.svg
+|   +-- file.svg
+|   \-- globe.svg
++-- scripts/
+|   \-- json.js
++-- i18n/
+|   \-- request.ts
++-- app/
+|   +-- [locale]/
+|   +-- api/
+|   |   +-- public/
+|   |   |   \-- tailscale-verify/
+|   |   |       \-- route.ts
+|   |   \-- admin/
+|   |       \-- [[...path]]/
+|   +-- admin/
+|   |   +-- services/
+|   |   |   +-- ServicesClient.tsx
+|   |   |   \-- page.tsx
+|   |   +-- monitor/
+|   |   |   +-- page.tsx
+|   |   |   \-- MonitorClient.tsx
+|   |   +-- home/
+|   |   |   +-- page.tsx
+|   |   |   \-- HomePageClient.tsx
+|   |   +-- settings/
+|   |   |   +-- SettingsClient.tsx
+|   |   |   \-- page.tsx
+|   |   +-- workers/
+|   |   |   +-- WorkersFinanceClient.tsx
+|   |   |   \-- page.tsx
+|   |   +-- terms/
+|   |   |   +-- TermsClient.tsx
+|   |   |   \-- page.tsx
+|   |   +-- store/
+|   |   |   +-- StorePageClient.tsx
+|   |   |   \-- page.tsx
+|   |   +-- contact/
+|   |   |   +-- page.tsx
+|   |   |   \-- ContactClient.tsx
+|   |   +-- bookings/
+|   |   |   +-- page.tsx
+|   |   |   \-- BookingsClient.tsx
+|   |   +-- about/
+|   |   |   +-- page.tsx
+|   |   |   \-- AboutAdminClient.tsx
+|   |   +-- dashboard/
+|   |   |   +-- page.tsx
+|   |   |   \-- DashboardClient.tsx
+|   |   +-- gallery/
+|   |   |   +-- page.tsx
+|   |   |   \-- GalleryPageClient.tsx
+|   |   +-- events/
+|   |   |   +-- page.tsx
+|   |   |   \-- EventsClient.tsx
+|   |   +-- data/
+|   |   |   +-- page.tsx
+|   |   |   \-- DataCentreClient.tsx
+|   |   +-- page.tsx
+|   |   +-- layout.tsx
+|   |   \-- AdminI18nProvider.tsx
+|   +-- layout.tsx
+|   +-- loading.tsx
+|   +-- not-found.tsx
+|   +-- error.tsx
+|   +-- faviconInlineScript.tsx
+|   \-- globals.css
++-- certs/
+|   +-- 100.118.151.3+3.pem
+|   \-- 100.118.151.3+3-key.pem
++-- components/
+|   +-- shared/
+|   |   +-- ScrollReveal.tsx
+|   |   +-- RetryableError.tsx
+|   |   +-- PageTransition.tsx
+|   |   +-- VisitorGeo.tsx
+|   |   +-- ShinyText.tsx
+|   |   +-- SessionExpired.tsx
+|   |   +-- FeatureGate.tsx
+|   |   +-- FaviconUpdater.tsx
+|   |   +-- ErrorBoundary.tsx
+|   |   +-- OfflineIndicator.tsx
+|   |   +-- LoadingSpinner.tsx
+|   |   \-- GlobalErrorPage.tsx
+|   +-- ui/
+|   |   +-- select.tsx
+|   |   +-- popover.tsx
+|   |   +-- marquee.tsx
+|   |   +-- switch.tsx
+|   |   +-- toggle.tsx
+|   |   +-- textarea.tsx
+|   |   +-- tabs.tsx
+|   |   +-- liquid-glass-highlight.tsx
+|   |   +-- command.tsx
+|   |   +-- button.tsx
+|   |   +-- badge.tsx
+|   |   +-- dialog.tsx
+|   |   +-- label.tsx
+|   |   +-- input.tsx
+|   |   \-- dropdown-menu.tsx
+|   +-- public/
+|   |   +-- HeroCarousel.tsx
+|   |   +-- ImageUpload.tsx
+|   |   +-- KeyFiguresSection.tsx
+|   |   +-- GoalsSection.tsx
+|   |   +-- FloatingNavbar.tsx
+|   |   +-- Footer.tsx
+|   |   +-- GallerySection.tsx
+|   |   +-- SiteLogo.tsx
+|   |   +-- SociableKITReviews.tsx
+|   |   +-- WhyChooseUsSection.tsx
+|   |   +-- ServicesSection.tsx
+|   |   +-- MiddleSection.tsx
+|   |   +-- Navbar.tsx
+|   |   +-- PhoneInput.tsx
+|   |   +-- BookPanel.tsx
+|   |   +-- CartSidebar.tsx
+|   |   +-- ChallengeSection.tsx
+|   |   +-- BookingSection.tsx
+|   |   +-- AboutSection.tsx
+|   |   +-- ApprovedBrands.tsx
+|   |   +-- BookingCalendar.tsx
+|   |   +-- EventTicker.tsx
+|   |   +-- FaqSection.tsx
+|   |   +-- FeaturedProducts.tsx
+|   |   +-- EventsPanelWrapper.tsx
+|   |   +-- ContactSection.tsx
+|   |   +-- CTASection.tsx
+|   |   \-- EventsPanel.tsx
+|   +-- admin/
+|   |   +-- ReviewsTab.tsx
+|   |   +-- RefreshButton.tsx
+|   |   +-- ProductsTab.tsx
+|   |   +-- ScheduleEditor.tsx
+|   |   +-- ServiceTypesTab.tsx
+|   |   +-- SecretCodesTab.tsx
+|   |   +-- ScheduleTab.tsx
+|   |   +-- ProductDetailDialog.tsx
+|   |   +-- MiniWalletChart.tsx
+|   |   +-- MessagesTab.tsx
+|   |   +-- MapPicker.tsx
+|   |   +-- NewsletterTab.tsx
+|   |   +-- PageTab.tsx
+|   |   +-- OrdersTab.tsx
+|   |   +-- NotificationsTab.tsx
+|   |   +-- VisitorsTab.tsx
+|   |   +-- VisitorGlobe.tsx
+|   |   +-- UserProfileTab.tsx
+|   |   +-- VisitorWorldMap.tsx
+|   |   +-- WorkersTab.tsx
+|   |   +-- WhyChooseUsTab.tsx
+|   |   +-- WalletTab.tsx
+|   |   +-- TrashNewsletterDialog.tsx
+|   |   +-- SortableList.tsx
+|   |   +-- SocialLinksEditor.tsx
+|   |   +-- SessionsTab.tsx
+|   |   +-- SystemSettingsTab.tsx
+|   |   +-- TrashDialog.tsx
+|   |   +-- ToolsTab.tsx
+|   |   +-- TailscaleStatus.tsx
+|   |   +-- ConfirmDialog.tsx
+|   |   +-- ChallengeTab.tsx
+|   |   +-- CategoriesTab.tsx
+|   |   +-- ContactInfoTab.tsx
+|   |   +-- CustomGlobe.tsx
+|   |   +-- ContentSettingsTab.tsx
+|   |   +-- ContactSubjectsTab.tsx
+|   |   +-- BrandsTab.tsx
+|   |   +-- AdminTopBar.tsx
+|   |   +-- AdminSidebar.tsx
+|   |   +-- ActionConfirmDialog.tsx
+|   |   +-- AuditLogsTab.tsx
+|   |   +-- BookingStatusBadge.tsx
+|   |   +-- BookingsTable.tsx
+|   |   +-- BookingDetailsDialog.tsx
+|   |   +-- GoalsTab.tsx
+|   |   +-- GenericTrashDialog.tsx
+|   |   +-- GenericFilterBar.tsx
+|   |   +-- HeroSlidesTab.tsx
+|   |   +-- LockScreen.tsx
+|   |   +-- KeyFiguresTab.tsx
+|   |   +-- IconPicker.tsx
+|   |   +-- GalleryItemsTab.tsx
+|   |   +-- DeleteConfirmDialog.tsx
+|   |   +-- DataTab.tsx
+|   |   +-- DashboardStats.tsx
+|   |   +-- EmailCodeField.tsx
+|   |   +-- GalleryCategoriesTab.tsx
+|   |   +-- FixedExpensesTab.tsx
+|   |   \-- FaqTab.tsx
+|   \-- providers/
+|       +-- NotificationsProvider.jsx
+|       +-- ProductCacheProvider.tsx
+|       +-- LockScreenProvider.tsx
+|       +-- NetworkStatusProvider.tsx
+|       +-- ServiceTypesProvider.tsx
+|       +-- SiteImagesProvider.tsx
+|       +-- TailscaleGateProvider.tsx
+|       +-- SessionProvider.tsx
+|       +-- SiteDataProvider.tsx
+|       +-- ContactInfoProvider.tsx
+|       +-- CookieConsentProvider.tsx
+|       +-- AdminWeatherProvider.tsx
+|       +-- CartProvider.tsx
+|       +-- ErrorHandler.tsx
+|       +-- FloatingPanelProvider.tsx
+|       +-- GoalsProvider.tsx
+|       +-- EventsProvider.tsx
+|       \-- FeatureFlagsProvider.tsx
++-- postcss.config.js
++-- package.json
++-- package-lock.json
++-- proxy.ts
++-- tsconfig.json
++-- tailwind.config.ts
++-- server.js
++-- eslint.config.mjs
++-- components.json
++-- .env.local
++-- frontend-audit.ps1
++-- next.config.js
++-- next-env.d.ts
+\-- navigation.ts

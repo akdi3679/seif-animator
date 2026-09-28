@@ -1,0 +1,1387 @@
+router.get('/status', async (req, res) => {
+ 
+
+  try {
+    const token = req.cookies?.token;
+    const csrfCookie = req.cookies?.csrf_token;
+    const refreshTokenCookie = req.cookies?.refreshToken;
+
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET) as any;
+        const valid = await validateSession(decoded.sessionId, req);
+        const csrfOk = !!csrfCookie && csrfCookie === decoded.csrfToken;
+        const refreshPresent = !!refreshTokenCookie;
+
+        // CONTRACT: /status now requires all three elements — token,
+        // csrf_token, refreshToken — present and consistent before
+        // trusting the session. Any single one failing is treated as a
+        // sensitive-element failure: clear everything and report logged
+        // out, rather than letting a partial state sit around.
+        if (valid && csrfOk && refreshPresent) {
+          return res.json({ user: { id: decoded.userId, email: decoded.email, role: decoded.role } });
+        }
+
+        console.warn('[STATUS] Session rejected — valid:', valid, 'csrfOk:', csrfOk, 'refreshPresent:', refreshPresent);
+        clearAuthCookies(res);
+        return res.json({ user: null });
+      } catch (err) {
+        console.warn('[STATUS] Token verification failed:', (err as Error).message);
+        clearAuthCookies(res);
+        return res.json({ user: null });
+      }
+    }
+
+    // No access token at all — nothing to clear, just report logged out.
+    return res.json({ user: null });
+  } catch (err) {
+    console.error('[STATUS] Unexpected error:', err);
+    return res.json({ user: null });
+  }
+});
+ router.post('/refresh', refreshLimiter, async (req, res, next) => {
+ 
+
+  
+
+  try {
+   
+    const presentedToken = req.cookies?.refreshToken;
+    console.log('refreshtoken : ' , presentedToken)
+    if (!presentedToken) {
+      return res.status(401).json({ error: 'Refresh token missing' });
+    }
+
+let validation;
+try {
+  validation = await validateRefreshToken(presentedToken);
+    console.log('validation : ' , validation)
+} catch (err) {
+  console.error('[REFRESH] Redis error during token validation:', err);
+  return res.status(503).json({ error: 'Service temporarily unavailable, please try again shortly' });
+}
+    if (validation.kind === 'invalid') {
+              console.log('validation kind invalid ')
+
+      clearAuthCookies(res);
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
+
+    if (validation.kind === 'reused' || validation.kind === 'password_changed') {
+        console.log('validation kind reused or password changed  ' )
+      await revokeRefreshFamily(validation.familyId);
+              console.log('validation kind reused or password changed  : revok refresh family ')
+
+      clearAuthCookies(res);
+console.log('validation kind reused or password changed  : clearing auth cookies  ')
+      logAudit({
+        userId: validation.userId,
+        action: validation.kind === 'password_changed'
+          ? 'REFRESH_TOKEN_PASSWORD_CHANGED'
+          : 'REFRESH_TOKEN_REUSE_DETECTED',
+        resource: 'User',
+        req,
+        success: false,
+      });
+      return res.status(401).json({ error: 'Session invalidated. Please log in again.' });
+    }
+
+    // C: user lookup with transient error handling
+   const { data: user, error: userErr } = await supabase
+  .from('User')
+  .select('id, email, role')
+  .eq('id', validation.userId)
+  .single();
+
+if (userErr && userErr.code !== 'PGRST116') {
+  console.error('[REFRESH] Supabase lookup failed:', userErr);
+  return res.status(503).json({ error: 'Service temporarily unavailable, please try again' });
+}
+
+if (!user) {
+  clearAuthCookies(res);
+  return res.status(401).json({ error: 'User no longer exists' });
+}
+    // D handling: validateSession is called inside createAndStoreSession; if it throws SESSION_CHECK_UNAVAILABLE we catch it below.
+    try {
+      if (validation.kind === 'retry') {
+        const sessionId = await createAndStoreSession(user.id, req, (req as any).geoLocation, {
+          tailscaleIP: (req as any).tailscaleClientIP,
+        });
+        const csrfToken = generateCsrfToken();
+        const accessToken = generateAccessToken({
+          userId: user.id,
+          email: user.email,
+          role: user.role,
+          sessionId,
+          tailscaleIP: (req as any).tailscaleClientIP,
+          csrfToken,
+          passwordEpoch: validation.passwordUpdatedAt,
+        });
+        setAuthCookies(res, accessToken, validation.reissueToken, csrfToken);
+        logAudit({ userId: user.id, action: 'TOKEN_REFRESH_RETRY', resource: 'User', req, success: true });
+        return res.json({ success: true, user: { id: user.id, email: user.email, role: user.role } });
+      }
+
+      // validation.kind === 'fresh'
+      const sessionId = await createAndStoreSession(user.id, req, (req as any).geoLocation, {
+        tailscaleIP: (req as any).tailscaleClientIP,
+      });
+      const csrfToken = generateCsrfToken();
+      const accessToken = generateAccessToken({
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        sessionId,
+        tailscaleIP: (req as any).tailscaleClientIP,
+        csrfToken,
+        passwordEpoch: validation.passwordUpdatedAt,
+      });
+      const newRefreshToken = await rotateRefreshToken(validation.familyId);
+      setAuthCookies(res, accessToken, newRefreshToken, csrfToken);
+      logAudit({ userId: user.id, action: 'TOKEN_REFRESH', resource: 'User', req, success: true });
+      res.json({ success: true, user: { id: user.id, email: user.email, role: user.role } });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'SESSION_CHECK_UNAVAILABLE') {
+        return res.status(503).json({ error: 'Service temporarily unavailable' });
+      }
+      throw err;
+    }
+  } catch (error) {
+    if (error instanceof Error && 'Operation failed' === 'SESSION_CHECK_UNAVAILABLE') {
+      return res.status(503).json({ error: 'Service temporarily unavailable' });
+    }
+    console.error('[REFRESH] Unexpected error:', error);
+    next(error as Error);
+  }
+});async function issueFullSession(
+  res: Response,
+  user: { id: string; email: string; role: string; updatedAt: string },
+  req: Request,
+  geo: any
+) {
+  const sessionId = await createAndStoreSession(user.id, req, geo, {
+    tailscaleIP: (req as any).tailscaleClientIP,
+  });
+  const csrfToken = generateCsrfToken();
+  const accessToken = generateAccessToken({
+    userId: user.id,
+    email: user.email,
+    role: user.role,
+    sessionId,
+    tailscaleIP: (req as any).tailscaleClientIP,
+    csrfToken,
+    passwordEpoch: user.updatedAt,
+  });
+  const refreshToken = await generateRefreshToken(user.id, user.updatedAt);
+  setAuthCookies(res, accessToken, refreshToken, csrfToken);
+  return { sessionId, accessToken, refreshToken, csrfToken };
+}router.post('/login', loginLimiter, async (req, res, next) => {
+ 
+
+  try {
+   
+    const validated = loginSchema.safeParse(req.body);
+    if (!validated.success) {
+      return res.status(400).json({ error: 'Validation failed', details: validated.error.errors.map(e => e.message).join(', ') });
+    }
+    const { email, password, geo } = validated.data;
+
+    // B: handle transient Supabase errors + timing-safe pw check
+   const { data: user, error: userErr } = await supabase
+  .from('User')
+  .select('id, email, role, passwordHash, twoFactorEnabled')
+  .eq('email', email)
+  .single();
+
+if (userErr && userErr.code !== 'PGRST116') {
+  console.error('[LOGIN] Supabase lookup failed:', userErr);
+  return res.status(503).json({ error: 'Service temporarily unavailable, please try again' });
+}
+const DUMMY_HASH = '$2b$12$invalidhashinvalidhashinvalidhashinvalidha';
+const valid = await verifyPassword(password, user ? user.passwordHash : DUMMY_HASH);
+
+    if (!user || !valid) {
+      const failKey = `login_fails:${email}`;
+      const fails = await redis.incr(failKey);
+      await redis.expire(failKey, 900);
+
+      logAudit({ action: 'LOGIN_FAILED', resource: 'User', req, success: false, metadata: { email } });
+
+      if (fails >= 3 && process.env.ADMIN_TELEGRAM_CHAT_ID) {
+        await sendTelegram(process.env.ADMIN_TELEGRAM_CHAT_ID,
+          `⚠️ *Multiple failed login attempts*\n` +
+          `Email: ${email}\n` +
+          `IP: ${req.ip}\n` +
+          `UA: ${req.headers['user-agent']?.substring(0, 100)}`
+        ).catch(() => {});
+      }
+
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+
+    if (user.twoFactorEnabled) {
+      const sessionId = randomBytes(16).toString('hex');
+      const code = generate2FACode();
+      const sessionData = { userId: user.id, email: user.email, role: user.role, geo: geo || null, createdAt: Date.now() };
+
+      await redis.setex(`2fa:${sessionId}`, TWO_FA_SESSION_TTL, JSON.stringify(sessionData));
+      await redis.setex(`2fa_code:${sessionId}`, TWO_FA_CODE_TTL, code);
+      await redis.setex(`2fa_attempts:${sessionId}`, TWO_FA_SESSION_TTL, '0');
+
+      await send2FACodeEmail(user.email, code);
+      logAudit({ userId: user.id, action: 'LOGIN_2FA_REQUIRED', resource: 'User', req, success: true });
+      return res.json({ requires2FA: true, sessionId });
+    }
+
+    await issueFullSession(res, user, req, geo || null);
+
+    await supabase.from('User').update({ lastLoginAt: new Date().toISOString() }).eq('id', user.id);
+    logAudit({ userId: user.id, action: 'LOGIN', resource: 'User', req, success: true });
+
+    res.json({ success: true, user: { id: user.id, email: user.email, role: user.role } });
+  } catch (error) {
+    console.error('[LOGIN] Unexpected error:', error);
+    next(error as Error);
+  }
+});
+export async function requireAdmin(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    }
+
+    const decoded = verifyToken(token) as any;
+if (decoded.role !== 'ADMIN') {
+  res.status(403).json({ error: 'Admin access required' });
+  return;
+}
+
+// Per the three-element rule: refreshToken must be present on every
+// admin action, not just on writes via CSRF. Missing it is treated the
+// same as any other sensitive-element failure — logout now.
+if (!req.cookies?.refreshToken) {
+  await logoutUser(decoded.userId);
+  res.status(401).json({ error: 'Session invalidated - missing refresh token' });
+  return;
+}
+    const isRefreshEndpoint = req.path === '/auth/refresh';
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !isRefreshEndpoint) {
+      const csrfHeader = req.headers['x-csrf-token'] as string;
+      if (!csrfHeader) {
+        res.status(403).json({ error: 'CSRF token missing' });
+        return;
+      }
+      
+      // Constant-time CSRF comparison
+      const a = Buffer.from(String(decoded.csrfToken));
+      const b = Buffer.from(String(csrfHeader));
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        res.status(403).json({ error: 'Invalid CSRF token' });
+        return;
+      }
+    }
+
+    const valid = await validateSession(decoded.sessionId, req);
+    if (!valid) {
+      await logoutUser(decoded.userId);
+      res.status(401).json({ error: 'Session invalidated - security violation detected' });
+      return;
+    }
+
+       // STRICT Tailscale Check (No bypass if missing)
+    // FIX: Use tailscaleClientIP which is set by validateTailscalePeer middleware
+    const clientTailscaleIP = (req as any).tailscaleClientIP; 
+    if (!clientTailscaleIP || !decoded.tailscaleIP || clientTailscaleIP !== decoded.tailscaleIP) {
+      console.error(`[Security] Tailscale IP mismatch or missing. Client: ${clientTailscaleIP}, Session: ${decoded.tailscaleIP}`);
+      await logoutUser(decoded.userId);
+      res.status(401).json({ error: 'Network violation detected' });
+      return;
+    }
+    req.user = {
+      id: decoded.userId,
+      email: decoded.email,
+      role: 'ADMIN',
+      sessionId: decoded.sessionId,
+      tailscaleIP: decoded.tailscaleIP,
+      csrfToken: decoded.csrfToken,
+    };
+
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}export async function validateRefreshToken(
+  presentedToken: string
+): Promise<RefreshValidationResult> {
+  const familyId = await redis.get(tokenIndexKey(presentedToken));
+  if (!familyId) return { kind: 'invalid' };
+
+  const raw = await redis.get(familyKey(familyId));
+  if (!raw) return { kind: 'invalid' };
+
+  const record: RefreshFamilyRecord = JSON.parse(raw);
+
+  // ---------- PASSWORD‑EPOCH CHECK ----------
+ const { data: user } = await supabase
+    .from('User')
+    .select('passwordChangedAt')
+    .eq('id', record.userId)
+    .maybeSingle();
+  if (!user || user.passwordChangedAt !== record.passwordUpdatedAt) {
+    return { kind: 'password_changed', userId: record.userId, familyId: record.familyId };
+  }
+
+  // ---------- NORMAL VALIDATION ----------
+  if (presentedToken === record.currentToken) {
+    return { kind: 'fresh', userId: record.userId, familyId: record.familyId, passwordUpdatedAt: record.passwordUpdatedAt };
+  }
+
+  if (
+    record.previousToken &&
+    presentedToken === record.previousToken &&
+    record.previousExpiresAt &&
+    Date.now() < record.previousExpiresAt
+  ) {
+    return {
+      kind: 'retry',
+      userId: record.userId,
+      familyId: record.familyId,
+      reissueToken: record.currentToken,
+      passwordUpdatedAt: record.passwordUpdatedAt,
+    };
+  }
+
+  // Token found in family but not current / not in‑grace previous → replay
+  return { kind: 'reused', userId: record.userId, familyId: record.familyId };
+}export async function rotateRefreshToken(familyId: string): Promise<string> {
+  const raw = await redis.get(familyKey(familyId));
+  if (!raw) throw new Error('Refresh family not found during rotation');
+
+  const record: RefreshFamilyRecord = JSON.parse(raw);
+  const newToken = randomBytes(32).toString('hex');
+
+  const updated: RefreshFamilyRecord = {
+    ...record,
+    previousToken: record.currentToken,
+    previousExpiresAt: Date.now() + ROTATION_GRACE_SECONDS * 1000,
+    currentToken: newToken,
+  };
+
+  await saveFamily(updated);
+  return newToken;
+}
+export async function generateRefreshToken(
+  userId: string,
+  passwordUpdatedAt: string
+): Promise<string> {
+  const familyId = randomBytes(16).toString('hex');
+  const token = randomBytes(32).toString('hex');
+
+  const record: RefreshFamilyRecord = {
+    familyId,
+    userId,
+    currentToken: token,
+    previousToken: null,
+    previousExpiresAt: null,
+    passwordUpdatedAt,
+    issuedAccessTokenJti: null,
+    createdAt: Date.now(),
+  };
+
+  await saveFamily(record);
+  return token;
+}export async function validateSession(sessionId: string, req: any): Promise<boolean> {
+  try {
+    let sessionData = await redis.get(`session:${sessionId}`);
+    if (sessionData) {
+      const session = JSON.parse(sessionData);
+      if (new Date(session.expiresAt) < new Date()) {
+        await redis.del(`session:${sessionId}`);
+        return false;
+      }
+      const remainingMs = new Date(session.expiresAt).getTime() - Date.now();
+      if (remainingMs < 10 * 60 * 1000) {
+        const newExpiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+        session.expiresAt = newExpiresAt;
+        await redis.setex(`session:${sessionId}`, 30 * 60, JSON.stringify(session));
+
+        supabase.from('Session').update({ expiresAt: newExpiresAt }).eq('id', sessionId).then(({ error }) => {
+          if (error) console.error('❌ Session DB extension failed:', error.message);
+        });
+      }
+
+      return validateIntegrity(session, req);
+    }
+
+    // Supabase fallback
+    const { data: session, error } = await supabase
+      .from('Session')
+      .select(`
+        id,
+        userId,
+        deviceFingerprint,
+        ipAddress,
+        geoLocation,
+        userAgent,
+        expiresAt,
+        user:User ( email, role )
+      `)
+      .eq('id', sessionId)
+      .single();
+
+   if (error && error.code !== 'PGRST116') {
+  console.error('[validateSession] Supabase lookup failed:', error);
+  return false; // fail closed — a sensitive check that couldn't be confirmed is treated as invalid
+}
+if (!session || new Date(session.expiresAt) < new Date()) {
+  return false;
+}
+    const dataToCache = {
+      userId: session.userId,
+      email: (session.user as any).email,
+      role: (session.user as any).role,
+      deviceFingerprint: session.deviceFingerprint,
+      ipAddress: session.ipAddress,
+      geoLocation: session.geoLocation,
+      userAgent: session.userAgent,
+      expiresAt: session.expiresAt,
+    };
+    const remainingSecs = Math.floor((new Date(session.expiresAt).getTime() - Date.now()) / 1000);
+    await redis
+      .setex(`session:${sessionId}`, Math.max(remainingSecs, 1), JSON.stringify(dataToCache))
+      .catch(err => console.error('❌ Redis repopulate failed:', err));
+
+    return validateIntegrity(dataToCache, req);
+  } catch (error) {
+    console.error('Session validation error:', error);
+    if (error instanceof Error && error.message === 'SESSION_CHECK_UNAVAILABLE') throw error;
+    return false;
+  }
+}export async function createAndStoreSession(
+  userId: string,
+  req: any,
+  geo?: any,
+  extraData?: { tailscaleIP?: string },
+  opts?: { skipCleanup?: boolean }
+): Promise<string> {
+ 
+  const fingerprint = generateFingerprint(extractFromRequest(req));
+  const sessionId = randomBytes(16).toString('hex');
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000);
+
+  const { error } = await supabase.from('Session').insert({
+    id: sessionId,
+    userId,
+    deviceFingerprint: fingerprint,
+    ipAddress: req.ip,
+    userAgent: req.headers['user-agent'],
+    geoLocation: geo || null,
+    expiresAt: expiresAt.toISOString(),
+  });
+
+  if (error) {
+    console.error('❌ Failed to create session in Supabase:', error);
+    throw new Error('Session creation failed');
+  }
+
+  if (extraData?.tailscaleIP) {
+    await supabase.from('User').update({ tailscaleIp: extraData.tailscaleIP }).eq('id', userId);
+  }
+
+  const sessionCache = {
+    userId,
+    deviceFingerprint: fingerprint,
+    ipAddress: req.ip,
+    userAgent: req.headers['user-agent'],
+    geoLocation: geo,
+    tailscaleIP: extraData?.tailscaleIP,
+    expiresAt: expiresAt.toISOString(),
+  };
+
+  await redis
+    .setex(`session:${sessionId}`, SESSION_TTL_SECONDS, JSON.stringify(sessionCache))
+    .catch(err => console.error('❌ Redis session caching failed:', err));
+
+  return sessionId;
+}
+
+export async function logoutUser(userId: string, sessionId?: string): Promise<void> {
+  if (sessionId) {
+    await redis.del(`session:${sessionId}`);
+  }
+  await supabase.from('Session').delete().eq('userId', userId);
+} , // backend/src/server.ts
+// Enterprise: Silent connections, state-change-only logging, exponential backoff
+// + Security hardening: request smuggling protection, cache poisoning prevention, robust admin creation
+
+import express from 'express'
+import cors from 'cors'
+import helmet from 'helmet'
+import cookieParser from 'cookie-parser'
+import dotenv from 'dotenv'        
+import { exec } from 'child_process'
+import { promisify } from 'util'
+import CircuitBreaker from 'opossum';
+import pRetry from 'p-retry';
+import cron from 'node-cron';
+import { syncCalEventTypes } from './services/cal-sync.service.js';
+import { systemLoadMiddleware } from './middleware/system-load.js';
+import { v2 as cloudinary } from 'cloudinary';
+
+
+
+
+
+dotenv.config()
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+const execAsync = promisify(exec)
+
+import { publicRoutes } from './routes/public/index.js'
+import { adminRoutes } from './routes/admin/index.js'
+import { validateTailscalePeer } from './middleware/tailscale.js'
+import { errorHandler } from './middleware/error-handler.js'
+import { closeQueues } from './lib/queue.js'
+import redis from './lib/redis.js'
+import { supabase, testSupabaseConnection } from './lib/supabase.js'
+import { createDefaultAdmin } from './services/auth-service.js'
+import { handleCalcomWebhook } from './routes/public/calcom-webhook.js';
+
+
+const PORT_PUBLIC = parseInt(process.env.PORT_PUBLIC || '4000')
+const PORT_ADMIN = parseInt(process.env.PORT_ADMIN || '4001')
+const NODE_ENV = process.env.NODE_ENV || 'development'
+const PUBLIC_CORS_ORIGIN = process.env.PUBLIC_CORS_ORIGIN?.split(',') || ['http://localhost:3000']
+const ADMIN_CORS_ORIGIN = process.env.ADMIN_CORS_ORIGIN?.split(',') || ['http://localhost:3000']
+
+//const retryTimers: Record<string, NodeJS.Timeout | null> = {}
+
+// ============================================
+// SILENT CONNECTION MANAGER (Enterprise Pattern)
+// ============================================
+
+interface ConnectionState {
+  connected: boolean
+  announced: boolean
+  failCount: number
+}
+
+const connections: Record<string, ConnectionState> = {
+  redis: { connected: false, announced: false, failCount: 0 },
+  supabase: { connected: false, announced: false, failCount: 0 }
+}
+
+const RETRY_BASE_MS = 5000
+const RETRY_MAX_MS = 60000
+
+function getRetryDelay(failCount: number): number {
+  return Math.min(RETRY_BASE_MS * Math.pow(2, failCount), RETRY_MAX_MS)
+}
+
+// Flag to ensure admin creation runs only once after supabase connects
+let adminCreated = false
+
+
+
+// Circuit breaker options
+const breakerOptions = {
+  timeout: 5000,          // fail if operation takes >5s
+  errorThresholdPercentage: 50, // open circuit after 50% failures
+  resetTimeout: 30000,    // try again after 30s
+};
+
+// Create circuit breakers for each service
+const redisBreaker = new CircuitBreaker(
+  async () => { await redis.ping(); return true; },
+  breakerOptions
+);
+
+const supabaseBreaker = new CircuitBreaker(
+  async () => {
+    const ok = await testSupabaseConnection();
+    if (!ok) throw new Error('Supabase unhealthy');
+    return true;
+  },
+  breakerOptions
+);
+
+// Event listeners for circuit breaker state changes (optional logging)
+if (process.env.NODE_ENV !== 'production') {
+
+redisBreaker.on('open', () => console.warn('🔴 Redis circuit OPEN'));
+redisBreaker.on('halfOpen', () => console.log('🔶 Redis circuit HALF-OPEN'));
+redisBreaker.on('close', () => console.log('✅ Redis circuit CLOSED'));
+
+supabaseBreaker.on('open', () => console.warn('🔴 Supabase circuit OPEN'));
+supabaseBreaker.on('halfOpen', () => console.log('🔶 Supabase circuit HALF-OPEN'));
+supabaseBreaker.on('close', () => console.log('✅ Supabase circuit CLOSED'));
+}
+async function manageConnectionWithBreaker(
+  name: string,
+  breaker: CircuitBreaker,
+  checkFn: () => Promise<boolean>
+): Promise<void> {
+  const state = connections[name];
+  
+  if (state.connected) {
+    // Silent health check via circuit breaker
+    try {
+      await breaker.fire();
+      return;
+    } catch {
+      state.connected = false;
+      state.failCount++;
+      if (state.announced) {
+        console.log(`⚠️  ${name} disconnected, circuit ${breaker.opened ? 'open' : breaker.pendingClose ? 'half-open' : 'closed'}`);
+        state.announced = false;
+      }
+    }
+  }
+  
+  // Try to reconnect using pRetry with exponential backoff
+  try {
+   await pRetry(
+  async () => {
+    try {
+      const result = await breaker.fire();
+      if (!result) throw new Error('Health check failed');
+      return result;
+    } catch (err) {
+      // Log the actual error
+      console.error(`⚠️  ${name} health check error:`, (err as Error).message || err);
+      throw err;
+    }
+  },
+  {
+    retries: 5,
+    factor: 2,
+    minTimeout: 1000,
+    maxTimeout: 30000,
+    onFailedAttempt: (error) => {
+      console.log(`⚠️  ${name} reconnect attempt ${error.attemptNumber} failed: ${(error as any).message}`);
+    },
+  }
+);
+    
+    // Success
+    state.connected = true;
+    state.failCount = 0;
+    if (!state.announced) {
+      console.log(`✅ ${name} connected`);
+      state.announced = true;
+      if (name === 'supabase' && !adminCreated) {
+        await createDefaultAdmin();
+        adminCreated = true;
+        console.log('✅ Admin creation check completed');
+      }
+    }
+  } catch {
+    state.connected = false;
+    const delay = getRetryDelay(state.failCount);
+   console.log(`⚠️  ${name} will retry in ${delay / 1000}s (circuit ${breaker.opened ? 'open' : breaker.pendingClose ? 'half-open' : 'closed'})`);
+    setTimeout(() => manageConnectionWithBreaker(name, breaker, checkFn), delay);
+  }
+}
+
+// Replace the old manageConnection calls in startConnectionManagers
+function startConnectionManagers() {
+  // Redis
+  const redisLoop = () => manageConnectionWithBreaker('redis', redisBreaker, async () => true);
+  // Supabase
+  const supabaseLoop = () => manageConnectionWithBreaker('supabase', supabaseBreaker, async () => true);
+  
+  redisLoop();
+  supabaseLoop();
+  
+  setInterval(() => {
+    redisLoop();
+    supabaseLoop();
+  }, 30000);
+}
+
+// ============================================
+// TAILSCALE
+// ============================================
+
+async function getTailscaleIP(): Promise<string> {
+  if (process.env.TAILSCALE_SERVER_IP) {
+    return process.env.TAILSCALE_SERVER_IP
+  }
+  try {
+    const { stdout } = await execAsync('tailscale ip -4')
+    return stdout.trim()
+  } catch {
+    if (process.env.NODE_ENV === 'production') {
+      console.error('❌ Failed to get Tailscale IP in production. Set TAILSCALE_SERVER_IP env.')
+      process.exit(1)
+    }
+    console.warn('⚠️ Tailscale not detected, falling back to localhost for development')
+    return '127.0.0.1'
+  }
+}
+
+// ============================================
+// REQUEST SMUGGLING PROTECTION
+// ============================================
+function preventRequestSmuggling(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const hasTE = req.headers['transfer-encoding'] !== undefined
+  const hasCL = req.headers['content-length'] !== undefined
+  if (hasTE && hasCL) {
+    return res.status(400).send('Bad Request: ambiguous headers')
+  }
+  next()
+}
+
+// ============================================
+// WEB CACHE POISONING PROTECTION (strip client cache headers)
+// ============================================
+function stripCacheHeaders(req: express.Request, _res: express.Response, next: express.NextFunction) {
+  delete req.headers['cache-control']
+  delete req.headers['pragma']
+  delete req.headers['expires']
+  next()
+}
+
+// ============================================
+// SERVERS
+// ============================================
+
+const publicApp = express()
+publicApp.set('trust proxy', 1);
+
+publicApp.use(helmet())
+publicApp.use(cors({
+  origin: PUBLIC_CORS_ORIGIN,
+  credentials: true,
+  optionsSuccessStatus: 200
+}))
+if (process.env.NODE_ENV === 'production') {
+
+publicApp.use(systemLoadMiddleware);
+}
+publicApp.use(cookieParser());
+
+// ✅ Mount webhook endpoint with raw body parser BEFORE the global JSON parser
+publicApp.post(
+  '/api/public/calcom-webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    (req as any).rawBody = req.body;
+    try {
+      req.body = JSON.parse(req.body.toString());
+    } catch {
+      req.body = {};
+    }
+    await handleCalcomWebhook(req, res);
+  }
+);
+
+console.log('✅ Webhook route mounted at /api/public/calcom-webhook');
+
+publicApp.use(express.json({ limit: '10mb' }))
+publicApp.use(express.urlencoded({ extended: true }))
+// Clear body for GET/HEAD
+publicApp.use((req, _res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') req.body = undefined
+  if (NODE_ENV !== 'production') {
+    console.log(`[REQUEST] ${req.method} ${req.url}`);
+  }
+  next()
+})
+// Security middleware order: smuggling first, then cache stripping, then signature
+publicApp.use(preventRequestSmuggling)
+publicApp.use(stripCacheHeaders) // only for public routes (optional, but safe)
+
+publicApp.get('/health', async (_req, res) => {
+  const allConnected = Object.values(connections).every(c => c.connected)
+  res.status(allConnected ? 200 : 503).json({
+    status: allConnected ? 'ok' : 'degraded',
+    timestamp: new Date().toISOString(),
+    connections: Object.fromEntries(Object.entries(connections).map(([k, v]) => [k, v.connected]))
+  })
+})
+
+publicApp.use('/api/public', publicRoutes)
+publicApp.use(errorHandler)
+
+const adminApp = express()
+adminApp.set('trust proxy', 1);
+
+adminApp.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+}))
+
+adminApp.use(cors({
+  origin: ADMIN_CORS_ORIGIN,
+  credentials: true,
+  optionsSuccessStatus: 200
+}))
+if (process.env.NODE_ENV === 'production') {
+
+adminApp.use(systemLoadMiddleware);
+}
+adminApp.use(express.json({ limit: '50mb' }))
+adminApp.use(express.urlencoded({ extended: true }))
+adminApp.use((req, _res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') req.body = undefined
+  next()
+})
+
+adminApp.use(cookieParser())
+// Admin also needs smuggling protection (though Tailscale reduces risk)
+adminApp.use(preventRequestSmuggling)
+
+adminApp.use(validateTailscalePeer)
+  
+adminApp.get('/health', (_req, res) => {
+  res.json({ status: 'ok', tailscale: true, timestamp: new Date().toISOString() })
+})
+
+adminApp.use('/api/admin', adminRoutes)
+adminApp.use(errorHandler)
+
+// ============================================
+// STARTUP
+// ============================================
+
+async function startServers() {
+  // Connection managers will handle admin creation on first supabase connect
+  startConnectionManagers()
+  
+  cron.schedule('*/5 * * * *', async () => {
+  // Only run if the feature flag is enabled
+  const { data } = await supabase
+    .from('FeatureFlag')
+    .select('is_enabled')
+    .eq('feature_name', 'cron_cal_sync')
+    .maybeSingle();
+
+  if (!data?.is_enabled) {
+    console.log('⏭️  Cal.com sync skipped – feature flag disabled');
+    return;
+  }
+
+  console.log('⏰ Running scheduled sync of Cal.com event types');
+  await syncCalEventTypes();
+});
+  cron.schedule('*/15 * * * *', async () => {
+  const now = new Date().toISOString();
+
+  const { error: sessionErr, count: sessionCount } = await supabase
+    .from('Session')
+    .update({ expiredAt: now })
+    .lt('expiresAt', now)
+    .is('expiredAt', null);
+  if (sessionErr) console.error('[Cron] Session sweep failed:', sessionErr);
+  else if (sessionCount) console.log(`[Cron] Marked ${sessionCount} expired sessions`);
+
+  const { error: refreshErr, count: refreshCount } = await supabase
+    .from('RefreshToken')
+    .update({ expiredAt: now })
+    .lt('expiresAt', now)
+    .is('expiredAt', null);
+  if (refreshErr) console.error('[Cron] RefreshToken sweep failed:', refreshErr);
+  else if (refreshCount) console.log(`[Cron] Marked ${refreshCount} expired refresh tokens`);
+});
+  cron.schedule('0 * * * *', async () => {
+  try {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    // List all images with tag 'booking-pending' and created before one hour ago
+    const result = await cloudinary.api.resources_by_tag('booking-pending', {
+      context: true,
+      max_results: 500,
+    });
+
+    const toDelete = result.resources
+      .filter((r: any) => new Date(r.created_at) < new Date(oneHourAgo))
+      .map((r: any) => r.public_id);
+
+    if (toDelete.length > 0) {
+      await cloudinary.api.delete_resources(toDelete);
+      console.log(`🧹 Cleaned up ${toDelete.length} abandoned booking images`);
+    }
+  } catch (err) {
+    console.error('❌ Error cleaning abandoned images:', err);
+  }
+});
+  cron.schedule('0 0 * * *', async () => {
+  const { error } = await supabase.from('Event').delete().lt('autoDeleteDate', new Date().toISOString());
+  if (error) console.error('Event cleanup error:', error);
+});
+cron.schedule('0 3 * * *', async () => {
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const tables = ['Booking', 'Message', 'Order', 'NewsletterSubscriber'];
+  for (const table of tables) {
+    const { error } = await supabase
+      .from(table)
+      .delete()
+      .not('deleted_at', 'is', null)
+      .lt('deleted_at', thirtyDaysAgo);
+    if (error) console.error(`Auto‑clean ${table} failed:`, error);
+  }
+});
+  cron.schedule('*/5 * * * *', async () => {
+  const count = parseInt(await redis.get('visitor:count:total') || '0');
+  if (count > 0) {
+    await redis.del('visitor:count:total');
+    await supabase.rpc('increment_visitors', { count });
+  }
+});
+  const tailscaleIP = await getTailscaleIP()
+  
+  const publicServer = publicApp.listen(PORT_PUBLIC, '0.0.0.0', () => {
+    console.log(`✅ Public API: http://localhost:${PORT_PUBLIC}`)
+  })
+  // Set server timeouts to mitigate slowloris and request smuggling
+  publicServer.requestTimeout = 120000 // 2 minutes (Node.js 18+)
+  publicServer.maxHeadersCount = 2000
+  
+  const adminServer = adminApp.listen(PORT_ADMIN, tailscaleIP, () => {
+    console.log(`🔒 Admin API: http://${tailscaleIP}:${PORT_ADMIN}`)
+  })
+  adminServer.requestTimeout = 120000
+  adminServer.maxHeadersCount = 2000
+  
+  console.log('\n🚀 Servers started')
+  console.log(`📋 Admin CORS allowed origins:`, ADMIN_CORS_ORIGIN)
+}
+
+// ============================================
+// SHUTDOWN
+// ============================================
+
+async function gracefulShutdown(signal: string) {
+  console.log(`\n${signal} received, shutting down...`)
+  try { await closeQueues() } catch {}
+  try { await redis.quit() } catch {}
+  process.exit(0)
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
+startServers() , const checkSession = useCallback(async (): Promise<{ user: User | null; transient: boolean }> => {
+  log('checking /auth/status');
+  try {
+    const data = await adminAPI<{ user: User | null }>('/auth/status');
+    if (data.user) {
+      log('status returned valid user:', data.user.email);
+      return { user: data.user, transient: false };
+    }
+  } catch (err) {
+    if (err instanceof ServerOverloadError) {
+      log('/status transient failure');
+      return { user: null, transient: true };
+    }
+    log('/status returned error (non-transient):', err);
+  }
+
+  // status said null — only call refresh if there's actually a
+  // refreshToken to give it. No cookie, no call. This is what closes
+  // the "refresh runs with nothing to refresh" complaint.
+  const hasRefreshCookie = document.cookie.includes('refreshToken=');
+  if (!hasRefreshCookie) {
+    log('no refreshToken cookie — real logged-out, not attempting refresh');
+    return { user: null, transient: false };
+  }
+
+  log('refreshToken present, attempting refresh...');
+  try {
+    await performRefresh();
+    const newData = await adminAPI<{ user: User | null }>('/auth/status');
+    log('post-refresh status user:', !!newData.user);
+    return { user: newData.user, transient: false };
+  } catch (err) {
+    if (err instanceof ServerOverloadError) {
+      log('refresh transient failure');
+      return { user: null, transient: true };
+    }
+    // refresh failed for a real reason (401/400/403) — sensitive element
+    // is invalid. Per the rule: logout now, do not retry, do not linger.
+    log('refresh failed (non-transient) — treating as logged out');
+    return { user: null, transient: false };
+  }
+}, []);
+ , const scheduleProactiveRefresh = useCallback(() => {
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = setTimeout(async () => {
+      try {
+        const success = await refreshSession();
+        if (success) {
+          scheduleProactiveRefresh();
+        } else {
+          log('proactive refresh failed, redirecting to login');
+          if (isAdminRoute) router.push('/fr/login?reason=session_expired');
+        }
+      } catch (error) {
+        if (error instanceof ServerOverloadError) {
+          log('proactive refresh transient error, retrying in 30s');
+          refreshTimerRef.current = setTimeout(() => scheduleProactiveRefresh(), 30000);
+        }
+      }
+    }, 12 * 60 * 1000);
+  }, [refreshSession, isAdminRoute, router]);
+
+  useEffect(() => {
+    if (checkedPathRef.current === pathname) return;
+    checkedPathRef.current = pathname;
+
+    const isProtectedRoute = isAdminRoute || isAuthPage;
+    if (!isProtectedRoute) {
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    let retryCount = 0;
+    const MAX_RETRIES = 5;
+
+   const attemptSessionRecovery = async () => {
+  if (!cancelled) setUser(null); // drop trust before checking — closes the stale-state gap
+
+  const { user, transient } = await checkSession();
+  if (cancelled) return;
+
+  if (user) {
+    setUser(user);
+    setLoading(false);
+    setServerUnavailable(false);
+    if (isAdminRoute) scheduleProactiveRefresh();
+    // redirect= is UX only — where to land after success, never a gate
+    // on whether to check/refresh.
+    const params = new URLSearchParams(window.location.search);
+    const redirectTarget = params.get('redirect');
+    if (isAuthPage && redirectTarget) router.push(redirectTarget);
+    return;
+  }
+
+  if (transient) {
+    if (retryCount < MAX_RETRIES) {
+      retryCount++;
+      const delay = Math.pow(2, retryCount) * 1000;
+      log(`server unreachable, retry ${retryCount}/${MAX_RETRIES} in ${delay / 1000}s`);
+      setTimeout(attemptSessionRecovery, delay);
+    } else {
+      log('server unreachable, all retries exhausted');
+      setServerUnavailable(true);
+      setLoading(false);
+    }
+    return;
+  }
+
+    // Confirmed invalid / logged out — clear the one cookie the browser can
+  // see (csrf_token; the httpOnly ones are already cleared server-side by
+  // /status or /refresh on their own failure paths) and redirect.
+  document.cookie = 'csrf_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; samesite=strict';
+  log('session invalid — logging out');
+  if (isAdminRoute) {
+    setLoading(false);   // ← ADD THIS LINE
+    const locale = pathname.split('/')[1];
+    router.push(`/${locale}/login?reason=unauthorized`);
+  } else {
+    setLoading(false);
+  }
+}; export async function performRefresh(): Promise<boolean> {
+  if (isRefreshing && refreshPromise) return refreshPromise;
+const sinceLastRefresh = Date.now() - lastRefreshResolvedAt;
+if (lastRefreshResult !== null && sinceLastRefresh < REFRESH_COOLDOWN_MS) return lastRefreshResult;
+  isRefreshing = true;
+  refreshPromise = (async () => {
+    let lastTransientError: Error | null = null;
+
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const csrf = getCsrfTokenFromCookie();
+          const res = await fetch('/api/admin/auth/refresh', {
+            method: 'POST',
+            credentials: 'include',
+            headers: csrf ? { 'X-CSRF-Token': csrf } : {},
+          });
+
+          if (res.ok) {
+            onTokenRefreshed(); lastRefreshResolvedAt = Date.now(); lastRefreshResult = true; return true;
+          }
+
+          // Refresh endpoint explicitly says the token is bad — this is a
+          // real auth failure, not a transient one. Clear cookies and stop
+          // retrying immediately.
+         if (res.status === 401 || res.status === 400 || res.status === 403) {
+  const error = new UnauthorizedError('Session expired');
+  onTokenRefreshFailed(error);
+  clearAuthCookies();
+  redirectToLogin('session_expired');
+  throw error;
+}
+          // Anything else (503 from load-shedding, 502/504 from a flaky
+          // proxy hop, etc.) is transient — retry with backoff, but do NOT
+          // treat it as proof the session is invalid.
+          lastTransientError = new ServerOverloadError(
+            'Refresh endpoint temporarily unavailable',
+            parseInt(res.headers.get('Retry-After') || '5', 10)
+          );
+          if (attempt < 2) {
+            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+            continue;
+          }
+        } catch (err) {
+          if (err instanceof UnauthorizedError) throw err;
+
+          // Network-level failure (fetch threw) — also transient.
+          lastTransientError = err as Error;
+          if (attempt < 2) {
+            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+            continue;
+          }
+        }
+      }
+
+      // All 3 attempts were transient failures — the backend was
+      // unreachable/overloaded throughout, but we have no evidence the
+      // refresh token itself is bad. Do NOT clear cookies. Surface the
+      // transient error so the caller can show a "reconnecting" state
+      // instead of bouncing the user to /login.
+      onTokenRefreshFailed(lastTransientError!);
+      throw lastTransientError;
+    } finally {
+      isRefreshing = false;
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+} , async function request<T>(
+  baseUrl: string,
+  endpoint: string,
+  options?: RequestInit,
+  retry = true
+): Promise<T> {
+  const fingerprintHeaders: Record<string, string> = {};
+
+  if (typeof window !== 'undefined') {
+    fingerprintHeaders['X-Screen-Resolution'] = `${window.screen.width}x${window.screen.height}`;
+    fingerprintHeaders['X-Timezone'] = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    fingerprintHeaders['X-Color-Depth'] = window.screen.colorDepth?.toString() || '';
+    fingerprintHeaders['X-Pixel-Ratio'] = window.devicePixelRatio?.toString() || '';
+    fingerprintHeaders['X-Touch-Support'] = ('ontouchstart' in window).toString();
+
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 200; canvas.height = 50;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.textBaseline = 'top'; ctx.font = '14px Arial';
+        ctx.fillStyle = '#f60'; ctx.fillRect(0, 0, 100, 50);
+        ctx.fillStyle = '#069'; ctx.fillText('Myshow.tn', 2, 15);
+        fingerprintHeaders['X-Canvas-Fingerprint'] = canvas.toDataURL().slice(0, 100);
+      }
+    } catch {}
+
+    try {
+      const gl = document.createElement('canvas').getContext('webgl');
+      if (gl) {
+        const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+        if (debugInfo) {
+          fingerprintHeaders['X-WebGL-Fingerprint'] = `${gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)}|${gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL)}`;
+        }
+      }
+    } catch {}
+  }
+
+  const fingerprint = await getDeviceFingerprint();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Device-Fingerprint': fingerprint,
+    ...(options?.headers as Record<string, string>),
+  };
+  Object.assign(headers, fingerprintHeaders);
+
+  const csrfToken = getCsrfTokenFromCookie();
+  if (csrfToken && options?.method && !['GET', 'HEAD'].includes(options.method)) {
+    headers['X-CSRF-Token'] = csrfToken;
+  }
+
+  const url = `${baseUrl}${endpoint}`;
+  let response: Response;
+  const isFormData = options?.body instanceof FormData;
+  if (isFormData) {
+    delete headers['Content-Type'];
+  }
+  try {
+    response = await fetch(url, {
+      ...options,
+      headers,
+      credentials: 'include',
+    });
+  } catch (fetchError: any) {
+    const isConnectionRefused =
+      fetchError?.message?.includes('ERR_CONNECTION_REFUSED') ||
+      (fetchError?.name === 'TypeError' &&
+        fetchError?.message === 'Failed to fetch' &&
+        typeof navigator !== 'undefined' &&
+        navigator.onLine);
+
+    if (isConnectionRefused) {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('backend-down'));
+      }
+      throw new ApiError('Service temporarily unavailable', 'BACKEND_DOWN', 0);
+    }
+    throw fetchError;
+  }
+
+  const AUTH_ENDPOINTS_NO_REFRESH = [
+    '/auth/login',
+    '/auth/verify-2fa',
+    '/auth/resend-2fa',
+    '/auth/forgot-password',
+    '/auth/reset-password',
+    '/auth/resend-reset-code',
+    '/auth/reset-session-info',
+    '/auth/2fa-session-info',
+    '/auth/refresh',
+    '/auth/status',
+  ];
+
+  if (response.status === 401 && retry) {
+    if (AUTH_ENDPOINTS_NO_REFRESH.some(e => endpoint.includes(e))) {
+      const data = await response.json().catch(() => ({}));
+      throw new ApiError(data.error || 'Unauthorized', 'UNAUTHORIZED', 401);
+    }
+
+    try {
+      const refreshed = await performRefresh();
+      if (refreshed) {
+        const freshCsrf = getCsrfTokenFromCookie();
+        const retryOptions: RequestInit = { ...options };
+        if (freshCsrf && options?.method && !['GET', 'HEAD'].includes(options.method)) {
+          retryOptions.headers = {
+            ...(options?.headers as Record<string, string>),
+            'X-CSRF-Token': freshCsrf,
+          };
+        }
+        return request<T>(baseUrl, endpoint, retryOptions, false);
+      }
+    } catch (error) {
+      // THE FIX: previously this just rethrew whatever performRefresh threw,
+      // which is still correct behavior — but now that error is reliably
+      // either UnauthorizedError (real auth failure) or ServerOverloadError
+      // (transient), so callers can branch on it meaningfully instead of
+      // treating every refresh failure as "log the user out."
+      throw error;
+    }
+  }
+
+  const contentType = response.headers.get('content-type');
+  if (!contentType || !contentType.includes('application/json')) {
+    const text = await response.text();
+    throw new ApiError('Invalid response', 'INVALID_RESPONSE', response.status);
+  }
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    if (response.status === 503) {
+      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('backend-overload'));
+      const retryAfter = response.headers.get('Retry-After') || '30';
+      throw new ServerOverloadError('Server under high load', parseInt(retryAfter));
+    }
+    if (response.status === 429) {
+      const retryAfter = parseInt(response.headers.get('Retry-After') || '60', 10);
+      if (
+        options?.method && ['GET', 'HEAD'].includes(options.method) &&
+        baseUrl === PUBLIC_API_URL
+      ) {
+        window.dispatchEvent(new CustomEvent('backend-rate-limit'));
+      }
+      throw new RateLimitError(data.error || 'Rate limit exceeded', retryAfter);
+    }
+    throw new ApiError(data.error || 'Request failed', data.code, response.status);
+  }
+
+  return data as T;
+}   , export async function authenticateToken(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '')
+    
+    if (!token) {
+      res.status(401).json({ error: 'Access denied' })
+      return
+    }
+    
+    // Verify JWT
+    const decoded = verifyToken(token) as any
+    
+    // Validate session integrity
+    const valid = await validateSession(decoded.sessionId, req)
+    if (!valid) {
+      res.status(401).json({ error: 'Session invalid' })
+      return
+    }
+    
+    // Attach user to request
+    req.user = {
+      id: decoded.userId,
+      email: decoded.email,
+      role: decoded.role,
+      sessionId: decoded.sessionId , 
+      csrfToken: decoded.csrfToken, 
+    }
+    
+    next()
+    
+  } catch {
+    res.status(401).json({ error: 'Invalid token' })
+  }
+}
+, export function requireAdmin(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  if (req.user?.role !== 'ADMIN') {
+    res.status(403).json({ error: 'Admin access required' })
+    return
+  }
+  next()
+} ( is required admin like this secure , no injection or confclit or miss or leak or hack ?? ) , async function issueFullSession(
+  res: Response,
+  user: { id: string; email: string; role: string; updatedAt: string },
+  req: Request,
+  geo: any
+) {
+  const sessionId = await createAndStoreSession(user.id, req, geo, {
+    tailscaleIP: (req as any).tailscaleClientIP,
+  });
+  const csrfToken = generateCsrfToken();
+  const accessToken = generateAccessToken({
+    userId: user.id,
+    email: user.email,
+    role: user.role,
+    sessionId,
+    tailscaleIP: (req as any).tailscaleClientIP,
+    csrfToken,
+    passwordEpoch: user.updatedAt,
+  });
+  const refreshToken = await generateRefreshToken(user.id, user.updatedAt);
+  setAuthCookies(res, accessToken, refreshToken, csrfToken);
+  return { sessionId, accessToken, refreshToken, csrfToken };
+}

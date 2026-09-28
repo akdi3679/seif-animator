@@ -1,0 +1,864 @@
+﻿
+===== src/lib/security/audit-logger.ts : 151 : 24  TS2339  Property 'tailscaleIP' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     150:       userAgent: req.headers['user-agent'] || 'unknown',
+>>>  151:       tailscaleIp: req.tailscaleIP,
+     152:       deviceFingerprint: req.headers['x-device-fingerprint'] as string,
+                            ^
+
+===== src/lib/security/audit-logger.ts : 309 : 35  TS2339  Property 'signatureValidated' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     308:           duration,
+>>>  309:           signatureValidated: req.signatureValidated,
+     310:         },
+                                       ^
+
+===== src/middleware/device-fingerprint.ts : 53 : 49  TS6133  'res' is declared but its value is never read. =====
+      52:  */
+>>>   53: export const deviceFingerprint = (req: Request, res: Response, next: NextFunction): void => {
+      54:   const fingerprint = generateDeviceFingerprint(req)
+                                                     ^
+
+===== src/middleware/error-handler.ts : 11 : 3  TS6133  'req' is declared but its value is never read. =====
+      10:   err: AppError | ZodError,
+>>>   11:   req: Request,
+      12:   res: Response,
+       ^
+
+===== src/middleware/tailscale.ts : 14 : 28  TS18048  'sourceIP' is possibly 'undefined'. =====
+      13:                      || req.ip
+>>>   14:     const strippedSource = sourceIP.replace(/^::ffff:/, '')
+      15: 
+                                ^
+
+===== src/middleware/tailscale.ts : 18 : 7  TS2322  Type 'Response<any, Record<string, any>>' is not assignable to type 'void'. =====
+      17:       console.log('[Tailscale] Source IP not Tailscale:', strippedSource)
+>>>   18:       return res.status(404).json({ error: 'Not found' })
+      19:     }
+           ^
+
+===== src/middleware/tailscale.ts : 24 : 7  TS2322  Type 'Response<any, Record<string, any>>' is not assignable to type 'void'. =====
+      23:       console.log('[Tailscale] Source IP not in peer list:', strippedSource)
+>>>   24:       return res.status(404).json({ error: 'Not found' })
+      25:     }
+           ^
+
+===== src/middleware/tailscale.ts : 31 : 7  TS2322  Type 'Response<any, Record<string, any>>' is not assignable to type 'void'. =====
+      30:       console.log('[Tailscale] Missing X-Forwarded-For header')
+>>>   31:       return res.status(404).json({ error: 'Not found' })
+      32:     }
+           ^
+
+===== src/middleware/tailscale.ts : 37 : 7  TS2322  Type 'Response<any, Record<string, any>>' is not assignable to type 'void'. =====
+      36:       console.log('[Tailscale] Client IP not Tailscale:', strippedClient)
+>>>   37:       return res.status(404).json({ error: 'Not found' })
+      38:     }
+           ^
+
+===== src/middleware/tailscale.ts : 42 : 7  TS2322  Type 'Response<any, Record<string, any>>' is not assignable to type 'void'. =====
+      41:       console.log('[Tailscale] Client IP not in peer list:', strippedClient)
+>>>   42:       return res.status(404).json({ error: 'Not found' })
+      43:     }
+           ^
+
+===== src/routes/admin/about.ts : 10 : 24  TS6133  'req' is declared but its value is never read. =====
+       9: // GET current About content
+>>>   10: router.get('/', async (req, res) => {
+      11:   const { data, error } = await supabase
+                            ^
+
+===== src/routes/admin/about.ts : 58 : 17  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      57:   logAudit({
+>>>   58:     userId: req.user!.id,
+      59:     action: 'UPDATE_ABOUT',
+                     ^
+
+===== src/routes/admin/auth.ts : 95 : 9  TS18046  'error' is of type 'unknown'. =====
+      94:   } catch (error) {
+>>>   95:     if (error.message === 'Email already registered') {
+      96:       logAudit({ action: 'REGISTER_FAILED', resource: 'User', req, success: false, metadata: { reason: 'Email already registered' } });
+             ^
+
+===== src/routes/admin/auth.ts : 375 : 22  TS2345  Argument of type 'string | undefined' is not assignable to parameter of type 'string'. =====
+     374:     if (ADMIN_TELEGRAM_CHAT_ID) {
+>>>  375:   await sendTelegram(process.env.ADMIN_TELEGRAM_CHAT_ID,
+     376:     `ðŸ” *Password reset requested*\nAdmin: ${user.email}\nIP: ${req.ip}`
+                          ^
+
+===== src/routes/admin/bookings.ts : 68 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      67:     logAudit({
+>>>   68:       userId: req.user?.id,
+      69:       action: 'VIEW_BOOKINGS',
+                       ^
+
+===== src/routes/admin/bookings.ts : 73 : 21  TS18046  'error' is of type 'unknown'. =====
+      72:       success: false,
+>>>   73:       errorMessage: error.message,
+      74:       metadata: { filter: req.query }
+                         ^
+
+===== src/routes/admin/bookings.ts : 100 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      99:     logAudit({
+>>>  100:       userId: req.user?.id,
+     101:       action: 'VIEW_BOOKING',
+                       ^
+
+===== src/routes/admin/bookings.ts : 113 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+     112:     logAudit({
+>>>  113:       userId: req.user?.id,
+     114:       action: 'VIEW_BOOKING',
+                       ^
+
+===== src/routes/admin/bookings.ts : 119 : 21  TS18046  'error' is of type 'unknown'. =====
+     118:       success: false,
+>>>  119:       errorMessage: error.message
+     120:     })
+                         ^
+
+===== src/routes/admin/bookings.ts : 171 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+     170:     logAudit({
+>>>  171:       userId: req.user?.id,
+     172:       action: 'CREATE_BOOKING',
+                       ^
+
+===== src/routes/admin/bookings.ts : 192 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+     191:     logAudit({
+>>>  192:       userId: req.user?.id,
+     193:       action: 'CREATE_BOOKING',
+                       ^
+
+===== src/routes/admin/bookings.ts : 197 : 21  TS18046  'error' is of type 'unknown'. =====
+     196:       success: false,
+>>>  197:       errorMessage: error.message,
+     198:       metadata: { body: req.body }
+                         ^
+
+===== src/routes/admin/bookings.ts : 231 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+     230:     logAudit({
+>>>  231:       userId: req.user?.id,
+     232:       action: 'UPDATE_BOOKING',
+                       ^
+
+===== src/routes/admin/bookings.ts : 244 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+     243:     logAudit({
+>>>  244:       userId: req.user?.id,
+     245:       action: 'UPDATE_BOOKING',
+                       ^
+
+===== src/routes/admin/bookings.ts : 250 : 21  TS18046  'error' is of type 'unknown'. =====
+     249:       success: false,
+>>>  250:       errorMessage: error.message,
+     251:       metadata: { updates: req.body }
+                         ^
+
+===== src/routes/admin/bookings.ts : 288 : 19  TS2339  Property 'user' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     287:     logAudit({
+>>>  288:       userId: req.user?.id,
+     289:       action: 'DELETE_BOOKING',
+                       ^
+
+===== src/routes/admin/bookings.ts : 295 : 24  TS2339  Property 'user' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     294:       metadata: { 
+>>>  295:         deletedBy: req.user?.email,
+     296:         booking: { id: booking.id, eventId: booking.eventId, childrenCount: booking.childrenCount }
+                            ^
+
+===== src/routes/admin/bookings.ts : 304 : 19  TS2339  Property 'user' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     303:     logAudit({
+>>>  304:       userId: req.user?.id,
+     305:       action: 'DELETE_BOOKING',
+                       ^
+
+===== src/routes/admin/bookings.ts : 310 : 21  TS18046  'error' is of type 'unknown'. =====
+     309:       success: false,
+>>>  310:       errorMessage: error.message
+     311:     })
+                         ^
+
+===== src/routes/admin/brands.ts : 9 : 24  TS6133  'req' is declared but its value is never read. =====
+       8: 
+>>>    9: router.get('/', async (req, res) => {
+      10:   const { data, error } = await supabase.from('Brand').select('*').order('order_index');
+                            ^
+
+===== src/routes/admin/brands.ts : 22 : 26  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      21:   if (error) return res.status(500).json({ error: error.message });
+>>>   22:   logAudit({ userId: req.user!.id, action: 'CREATE_BRAND', resource: 'Brand', resourceId: data.id, req, success: true });
+      23:   res.status(201).json(data);
+                              ^
+
+===== src/routes/admin/brands.ts : 35 : 26  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      34:   if (error) return res.status(500).json({ error: error.message });
+>>>   35:   logAudit({ userId: req.user!.id, action: 'UPDATE_BRAND', resource: 'Brand', resourceId: id, req, success: true });
+      36:   res.json(data);
+                              ^
+
+===== src/routes/admin/brands.ts : 43 : 26  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      42:   if (error) return res.status(500).json({ error: error.message });
+>>>   43:   logAudit({ userId: req.user!.id, action: 'DELETE_BRAND', resource: 'Brand', resourceId: id, req, success: true });
+      44:   res.json({ success: true });
+                              ^
+
+===== src/routes/admin/categories.ts : 18 : 24  TS6133  'req' is declared but its value is never read. =====
+      17: // GET all categories (flat list for admin)
+>>>   18: router.get('/', async (req, res, next) => {
+      19:   try {
+                            ^
+
+===== src/routes/admin/events.ts : 32 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      31:     logAudit({
+>>>   32:       userId: req.user?.id,
+      33:       action: 'VIEW_EVENTS',
+                       ^
+
+===== src/routes/admin/events.ts : 44 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      43:     logAudit({
+>>>   44:       userId: req.user?.id,
+      45:       action: 'VIEW_EVENTS',
+                       ^
+
+===== src/routes/admin/events.ts : 49 : 21  TS18046  'error' is of type 'unknown'. =====
+      48:       success: false,
+>>>   49:       errorMessage: error.message,
+      50:       metadata: { filter: req.query }
+                         ^
+
+===== src/routes/admin/events.ts : 71 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      70:     logAudit({
+>>>   71:       userId: req.user?.id,
+      72:       action: 'VIEW_EVENT',
+                       ^
+
+===== src/routes/admin/events.ts : 84 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      83:     logAudit({
+>>>   84:       userId: req.user?.id,
+      85:       action: 'VIEW_EVENT',
+                       ^
+
+===== src/routes/admin/events.ts : 90 : 21  TS18046  'error' is of type 'unknown'. =====
+      89:       success: false,
+>>>   90:       errorMessage: error.message
+      91:     })
+                         ^
+
+===== src/routes/admin/events.ts : 120 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+     119:     logAudit({
+>>>  120:       userId: req.user?.id,
+     121:       action: 'CREATE_EVENT',
+                       ^
+
+===== src/routes/admin/events.ts : 142 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+     141:     logAudit({
+>>>  142:       userId: req.user?.id,
+     143:       action: 'CREATE_EVENT',
+                       ^
+
+===== src/routes/admin/events.ts : 147 : 21  TS18046  'error' is of type 'unknown'. =====
+     146:       success: false,
+>>>  147:       errorMessage: error.message,
+     148:       metadata: { body: req.body }
+                         ^
+
+===== src/routes/admin/events.ts : 173 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+     172:     logAudit({
+>>>  173:       userId: req.user?.id,
+     174:       action: 'UPDATE_EVENT',
+                       ^
+
+===== src/routes/admin/events.ts : 186 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+     185:     logAudit({
+>>>  186:       userId: req.user?.id,
+     187:       action: 'UPDATE_EVENT',
+                       ^
+
+===== src/routes/admin/events.ts : 192 : 21  TS18046  'error' is of type 'unknown'. =====
+     191:       success: false,
+>>>  192:       errorMessage: error.message,
+     193:       metadata: { updates: req.body }
+                         ^
+
+===== src/routes/admin/events.ts : 231 : 19  TS2339  Property 'user' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     230:     logAudit({
+>>>  231:       userId: req.user?.id,
+     232:       action: 'DELETE_EVENT',
+                       ^
+
+===== src/routes/admin/events.ts : 238 : 24  TS2339  Property 'user' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     237:       metadata: { 
+>>>  238:         deletedBy: req.user?.email,
+     239:         event: { id: event.id, titleFr: event.titleFr, date: event.date }
+                            ^
+
+===== src/routes/admin/events.ts : 247 : 19  TS2339  Property 'user' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     246:     logAudit({
+>>>  247:       userId: req.user?.id,
+     248:       action: 'DELETE_EVENT',
+                       ^
+
+===== src/routes/admin/events.ts : 253 : 21  TS18046  'error' is of type 'unknown'. =====
+     252:       success: false,
+>>>  253:       errorMessage: error.message
+     254:     })
+                         ^
+
+===== src/routes/admin/export.ts : 22 : 20  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      21:     const job = await exportQueue.add('generate-export', {
+>>>   22:       adminId: req.user!.id,
+      23:       timestamp: Date.now()
+                        ^
+
+===== src/routes/admin/export.ts : 27 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      26:     logAudit({
+>>>   27:       userId: req.user?.id,
+      28:       action: 'EXPORT_STARTED',
+                       ^
+
+===== src/routes/admin/export.ts : 35 : 22  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      34:         jobId: job.id,
+>>>   35:         adminId: req.user!.id,
+      36:         adminEmail: req.user?.email
+                          ^
+
+===== src/routes/admin/export.ts : 36 : 25  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      35:         adminId: req.user!.id,
+>>>   36:         adminEmail: req.user?.email
+      37:       }
+                             ^
+
+===== src/routes/admin/export.ts : 48 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      47:     logAudit({
+>>>   48:       userId: req.user?.id,
+      49:       action: 'EXPORT_STARTED',
+                       ^
+
+===== src/routes/admin/export.ts : 53 : 21  TS18046  'error' is of type 'unknown'. =====
+      52:       success: false,
+>>>   53:       errorMessage: error.message
+      54:     })
+                         ^
+
+===== src/routes/admin/export.ts : 175 : 56  TS2554  Expected 1 arguments, but got 2. =====
+     174:   const password = process.env.EXPORT_ENCRYPTION_PASSWORD!
+>>>  175:   const encrypted = encryptBuffer(Buffer.from(buffer), password)
+     176:   
+                                                            ^
+
+===== src/routes/admin/goals.ts : 10 : 29  TS6133  'req' is declared but its value is never read. =====
+       9: // GET all goal types (with achievements)
+>>>   10: router.get('/types', async (req, res) => {
+      11:   const { data, error } = await supabase
+                                 ^
+
+===== src/routes/admin/goals.ts : 27 : 26  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      26:   if (error) return res.status(500).json({ error: error.message });
+>>>   27:   logAudit({ userId: req.user!.id, action: 'CREATE_GOAL_TYPE', resource: 'GoalType', resourceId: data.id, req, success: true });
+      28:   res.status(201).json(data);
+                              ^
+
+===== src/routes/admin/goals.ts : 41 : 26  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      40:   if (error) return res.status(500).json({ error: error.message });
+>>>   41:   logAudit({ userId: req.user!.id, action: 'UPDATE_GOAL_TYPE', resource: 'GoalType', resourceId: id, req, success: true });
+      42:   res.json(data);
+                              ^
+
+===== src/routes/admin/goals.ts : 50 : 26  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      49:   if (error) return res.status(500).json({ error: error.message });
+>>>   50:   logAudit({ userId: req.user!.id, action: 'DELETE_GOAL_TYPE', resource: 'GoalType', resourceId: id, req, success: true });
+      51:   res.json({ success: true });
+                              ^
+
+===== src/routes/admin/goals.ts : 73 : 26  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      72:   if (error) return res.status(500).json({ error: error.message });
+>>>   73:   logAudit({ userId: req.user!.id, action: 'UPSERT_GOAL_ACHIEVEMENT', resource: 'GoalAchievement', resourceId: data.id, req, success: true });
+      74:   res.json(data);
+                              ^
+
+===== src/routes/admin/health.ts : 7 : 24  TS6133  'req' is declared but its value is never read. =====
+       6: 
+>>>    7: router.get('/', async (req, res) => {
+       8:   try {
+                            ^
+
+===== src/routes/admin/hero.ts : 10 : 24  TS6133  'req' is declared but its value is never read. =====
+       9: // GET all slides (including inactive)
+>>>   10: router.get('/', async (req, res) => {
+      11:   const { data, error } = await supabase
+                            ^
+
+===== src/routes/admin/hero.ts : 28 : 26  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      27:   if (error) return res.status(500).json({ error: error.message });
+>>>   28:   logAudit({ userId: req.user!.id, action: 'CREATE_HERO_SLIDE', resource: 'HeroSlide', resourceId: data.id, req, success: true });
+      29:   res.status(201).json(data);
+                              ^
+
+===== src/routes/admin/hero.ts : 43 : 26  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      42:   if (error) return res.status(500).json({ error: error.message });
+>>>   43:   logAudit({ userId: req.user!.id, action: 'UPDATE_HERO_SLIDE', resource: 'HeroSlide', resourceId: id, req, success: true });
+      44:   res.json(data);
+                              ^
+
+===== src/routes/admin/hero.ts : 52 : 26  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      51:   if (error) return res.status(500).json({ error: error.message });
+>>>   52:   logAudit({ userId: req.user!.id, action: 'DELETE_HERO_SLIDE', resource: 'HeroSlide', resourceId: id, req, success: true });
+      53:   res.json({ success: true });
+                              ^
+
+===== src/routes/admin/pages.ts : 18 : 24  TS6133  'req' is declared but its value is never read. =====
+      17: // GET all pages
+>>>   18: router.get('/', async (req, res, next) => {
+      19:   try {
+                            ^
+
+===== src/routes/admin/products.ts : 26 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      25:     logAudit({
+>>>   26:       userId: req.user?.id,
+      27:       action: 'VIEW_PRODUCTS',
+                       ^
+
+===== src/routes/admin/products.ts : 38 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      37:     logAudit({
+>>>   38:       userId: req.user?.id,
+      39:       action: 'VIEW_PRODUCTS',
+                       ^
+
+===== src/routes/admin/products.ts : 43 : 21  TS18046  'error' is of type 'unknown'. =====
+      42:       success: false,
+>>>   43:       errorMessage: error.message,
+      44:       metadata: { filter: req.query }
+                         ^
+
+===== src/routes/admin/products.ts : 65 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      64:     logAudit({
+>>>   65:       userId: req.user?.id,
+      66:       action: 'VIEW_PRODUCT',
+                       ^
+
+===== src/routes/admin/products.ts : 78 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      77:     logAudit({
+>>>   78:       userId: req.user?.id,
+      79:       action: 'VIEW_PRODUCT',
+                       ^
+
+===== src/routes/admin/products.ts : 84 : 21  TS18046  'error' is of type 'unknown'. =====
+      83:       success: false,
+>>>   84:       errorMessage: error.message
+      85:     })
+                         ^
+
+===== src/routes/admin/products.ts : 104 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+     103:     logAudit({
+>>>  104:       userId: req.user?.id,
+     105:       action: 'CREATE_PRODUCT',
+                       ^
+
+===== src/routes/admin/products.ts : 126 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+     125:     logAudit({
+>>>  126:       userId: req.user?.id,
+     127:       action: 'CREATE_PRODUCT',
+                       ^
+
+===== src/routes/admin/products.ts : 131 : 21  TS18046  'error' is of type 'unknown'. =====
+     130:       success: false,
+>>>  131:       errorMessage: error.message,
+     132:       metadata: { body: req.body }
+                         ^
+
+===== src/routes/admin/products.ts : 157 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+     156:     logAudit({
+>>>  157:       userId: req.user?.id,
+     158:       action: 'UPDATE_PRODUCT',
+                       ^
+
+===== src/routes/admin/products.ts : 170 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+     169:     logAudit({
+>>>  170:       userId: req.user?.id,
+     171:       action: 'UPDATE_PRODUCT',
+                       ^
+
+===== src/routes/admin/products.ts : 176 : 21  TS18046  'error' is of type 'unknown'. =====
+     175:       success: false,
+>>>  176:       errorMessage: error.message,
+     177:       metadata: { updates: req.body }
+                         ^
+
+===== src/routes/admin/products.ts : 199 : 19  TS2339  Property 'user' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     198:     logAudit({
+>>>  199:       userId: req.user?.id,
+     200:       action: 'DELETE_PRODUCT',
+                       ^
+
+===== src/routes/admin/products.ts : 206 : 24  TS2339  Property 'user' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     205:       metadata: { 
+>>>  206:         deletedBy: req.user?.email,
+     207:         product: { id: product.id, nameFr: product.nameFr, price: product.price }
+                            ^
+
+===== src/routes/admin/products.ts : 215 : 19  TS2339  Property 'user' does not exist on type 'Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>'. =====
+     214:     logAudit({
+>>>  215:       userId: req.user?.id,
+     216:       action: 'DELETE_PRODUCT',
+                       ^
+
+===== src/routes/admin/products.ts : 221 : 21  TS18046  'error' is of type 'unknown'. =====
+     220:       success: false,
+>>>  221:       errorMessage: error.message
+     222:     })
+                         ^
+
+===== src/routes/admin/services.ts : 10 : 24  TS6133  'req' is declared but its value is never read. =====
+       9: // GET all services (including inactive)
+>>>   10: router.get('/', async (req, res) => {
+      11:   try {
+                            ^
+
+===== src/routes/admin/services.ts : 55 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      54:     logAudit({
+>>>   55:       userId: req.user!.id,
+      56:       action: 'CREATE_SERVICE',
+                       ^
+
+===== src/routes/admin/services.ts : 90 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      89:     logAudit({
+>>>   90:       userId: req.user!.id,
+      91:       action: 'UPDATE_SERVICE',
+                       ^
+
+===== src/routes/admin/services.ts : 119 : 19  TS2339  Property 'user' does not exist on type 'Request<{ id: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+     118:     logAudit({
+>>>  119:       userId: req.user!.id,
+     120:       action: 'DELETE_SERVICE',
+                       ^
+
+===== src/routes/admin/settings.ts : 26 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      25:     logAudit({
+>>>   26:       userId: req.user?.id,
+      27:       action: 'VIEW_SETTINGS',
+                       ^
+
+===== src/routes/admin/settings.ts : 38 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      37:     logAudit({
+>>>   38:       userId: req.user?.id,
+      39:       action: 'VIEW_SETTINGS',
+                       ^
+
+===== src/routes/admin/settings.ts : 43 : 21  TS18046  'error' is of type 'unknown'. =====
+      42:       success: false,
+>>>   43:       errorMessage: error.message
+      44:     })
+                         ^
+
+===== src/routes/admin/settings.ts : 70 : 19  TS2339  Property 'user' does not exist on type 'Request<{ userId: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      69:     logAudit({
+>>>   70:       userId: req.user?.id,
+      71:       action: 'UPDATE_SETTINGS',
+                       ^
+
+===== src/routes/admin/settings.ts : 92 : 19  TS2339  Property 'user' does not exist on type 'Request<{ userId: string; }, any, any, ParsedQs, Record<string, any>>'. =====
+      91:     logAudit({
+>>>   92:       userId: req.user?.id,
+      93:       action: 'UPDATE_SETTINGS',
+                       ^
+
+===== src/routes/admin/settings.ts : 98 : 21  TS18046  'error' is of type 'unknown'. =====
+      97:       success: false,
+>>>   98:       errorMessage: error.message,
+      99:       metadata: { userId: req.params.userId, enabled: req.body.enabled }
+                         ^
+
+===== src/routes/admin/settings.ts : 120 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+     119:     logAudit({
+>>>  120:       userId: req.user?.id,
+     121:       action: 'UPDATE_SETTINGS',
+                       ^
+
+===== src/routes/admin/settings.ts : 127 : 24  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+     126:         setting: 'deleteVerificationCode',
+>>>  127:         changedBy: req.user?.email,
+     128:         codeChanged: true
+                            ^
+
+===== src/routes/admin/settings.ts : 141 : 19  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+     140:     logAudit({
+>>>  141:       userId: req.user?.id,
+     142:       action: 'UPDATE_SETTINGS',
+                       ^
+
+===== src/routes/admin/settings.ts : 146 : 21  TS18046  'error' is of type 'unknown'. =====
+     145:       success: false,
+>>>  146:       errorMessage: error.message,
+     147:       metadata: { setting: 'deleteVerificationCode' }
+                         ^
+
+===== src/routes/admin/systeme-health.ts : 7 : 24  TS6133  'req' is declared but its value is never read. =====
+       6: 
+>>>    7: router.get('/system', (req, res) => {
+       8:   res.json(getSystemHealth());
+                            ^
+
+===== src/routes/admin/terms.ts : 10 : 24  TS6133  'req' is declared but its value is never read. =====
+       9: // GET current terms
+>>>   10: router.get('/', async (req, res) => {
+      11:   const { data, error } = await supabase
+                            ^
+
+===== src/routes/admin/terms.ts : 48 : 17  TS2339  Property 'user' does not exist on type 'Request<{}, any, any, ParsedQs, Record<string, any>>'. =====
+      47:   logAudit({
+>>>   48:     userId: req.user!.id,
+      49:     action: 'UPDATE_TERMS',
+                     ^
+
+===== src/routes/public/about.ts : 6 : 24  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.get('/', async (req, res) => {
+       7:   res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+                            ^
+
+===== src/routes/public/about.ts : 23 : 31  TS6133  'req' is declared but its value is never read. =====
+      22: 
+>>>   23: router.get('/summary', async (req, res) => {
+      24:   res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+                                   ^
+
+===== src/routes/public/admin-schedule.ts : 6 : 24  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.get('/', async (req, res) => {
+       7:     res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=30');
+                            ^
+
+===== src/routes/public/booking-events.ts : 37 : 33  TS7006  Parameter 'message' implicitly has an 'any' type. =====
+      36:   await subscriber.subscribe(channel)
+>>>   37:   subscriber.on('message', (ch, message) => {
+      38:     if (ch === channel) {
+                                     ^
+
+===== src/routes/public/booking-events.ts : 37 : 29  TS7006  Parameter 'ch' implicitly has an 'any' type. =====
+      36:   await subscriber.subscribe(channel)
+>>>   37:   subscriber.on('message', (ch, message) => {
+      38:     if (ch === channel) {
+                                 ^
+
+===== src/routes/public/brands.ts : 7 : 24  TS6133  'req' is declared but its value is never read. =====
+       6: 
+>>>    7: router.get('/', async (req, res) => {
+       8:   if (!(await isFeatureEnabled('brands'))) {
+                            ^
+
+===== src/routes/public/calcom-webhook.ts : 65 : 10  TS18049  'result.count' is possibly 'null' or 'undefined'. =====
+      64:   }
+>>>   65:   return result?.count > 0;
+      66: }
+              ^
+
+===== src/routes/public/calcom-webhook.ts : 191 : 32  TS2769  No overload matches this call. =====
+     190:       const updateData: any = {
+>>>  191:         desired_date: new Date(newStartTime).toISOString(),
+     192:         duration_minutes: duration,
+                                    ^
+
+===== src/routes/public/categories.ts : 7 : 24  TS6133  'req' is declared but its value is never read. =====
+       6: 
+>>>    7: router.get('/', async (req, res) => {
+       8:   const { data, error } = await supabase
+                            ^
+
+===== src/routes/public/challenge.ts : 7 : 24  TS6133  'req' is declared but its value is never read. =====
+       6: 
+>>>    7: router.get('/', async (req, res) => {
+       8:   if (!(await isFeatureEnabled('challenge'))) {
+                            ^
+
+===== src/routes/public/contact.ts : 44 : 36  TS7006  Parameter 's' implicitly has an 'any' type. =====
+      43:   : validated.subjectId
+>>>   44:     ? `ðŸ“Œ *Sujet:* ${subjects.find(s => s.id === validated.subjectId)?.title_fr || 'Sujet'}`
+      45:     : '';
+                                        ^
+
+===== src/routes/public/contact.ts : 44 : 22  TS2304  Cannot find name 'subjects'. =====
+      43:   : validated.subjectId
+>>>   44:     ? `ðŸ“Œ *Sujet:* ${subjects.find(s => s.id === validated.subjectId)?.title_fr || 'Sujet'}`
+      45:     : '';
+                          ^
+
+===== src/routes/public/contact-info.ts : 6 : 24  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.get('/', async (req, res) => {
+       7:     res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=30');
+                            ^
+
+===== src/routes/public/contact-subjects.ts : 6 : 24  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.get('/', async (req, res) => {
+       7:   res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+                            ^
+
+===== src/routes/public/events.ts : 8 : 24  TS6133  'req' is declared but its value is never read. =====
+       7: // GET /api/public/events
+>>>    8: router.get('/', async (req, res) => {
+       9:    if (!(await isFeatureEnabled('events'))) {
+                            ^
+
+===== src/routes/public/faq.ts : 7 : 24  TS6133  'req' is declared but its value is never read. =====
+       6: 
+>>>    7: router.get('/', async (req, res) => {
+       8:   if (!(await isFeatureEnabled('faq'))) {
+                            ^
+
+===== src/routes/public/feature-flags.ts : 4 : 24  TS6133  'req' is declared but its value is never read. =====
+       3: const router = Router();
+>>>    4: router.get('/', async (req, res) => {
+       5:   res.set('Cache-Control', 'public, max-age=300');
+                            ^
+
+===== src/routes/public/gallery.ts : 112 : 34  TS6133  'req' is declared but its value is never read. =====
+     111: // â”€â”€ GET /api/public/gallery/categories â€“ used by homepage section â”€â”€
+>>>  112: router.get('/categories', async (req, res) => {
+     113:   if (!(await isFeatureEnabled('gallery'))) return res.status(404).json({ error: 'Feature disabled' });
+                                      ^
+
+===== src/routes/public/goals.ts : 7 : 24  TS6133  'req' is declared but its value is never read. =====
+       6: 
+>>>    7: router.get('/', async (req, res) => {
+       8:   if (!(await isFeatureEnabled('goals'))) return res.status(404).json({ error: 'Feature disabled' });
+                            ^
+
+===== src/routes/public/hero.ts : 6 : 24  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.get('/', async (req, res) => {
+       7:   res.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=600');
+                            ^
+
+===== src/routes/public/index.ts : 29 : 30  TS5097  An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled. =====
+      28: import termsRoutes from './terms.js';
+>>>   29: import newsletterRoutes from './newsletter.ts';
+      30: import aboutRoutes from './about.js';
+                                  ^
+
+===== src/routes/public/services.ts : 8 : 24  TS6133  'req' is declared but its value is never read. =====
+       7: // GET active services for public display
+>>>    8: router.get('/', async (req, res) => {
+       9:   if (!(await isFeatureEnabled('services'))) {
+                            ^
+
+===== src/routes/public/service-types.ts : 6 : 24  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.get('/', async (req, res, next) => {
+       7:   res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=60');
+                            ^
+
+===== src/routes/public/sign-upload.ts : 6 : 25  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.post('/', async (req, res) => {
+       7:   const timestamp = Math.round(Date.now() / 1000)
+                             ^
+
+===== src/routes/public/site-data.ts : 5 : 24  TS6133  'req' is declared but its value is never read. =====
+       4: const router = Router();
+>>>    5: router.get('/', async (req, res) => {
+       6:   res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+                            ^
+
+===== src/routes/public/site-images.ts : 6 : 24  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.get('/', async (req, res) => {
+       7:   res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+                            ^
+
+===== src/routes/public/terms.ts : 6 : 24  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.get('/', async (req, res) => {
+       7:   res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+                            ^
+
+===== src/routes/public/why-choose-us.ts : 6 : 24  TS6133  'req' is declared but its value is never read. =====
+       5: 
+>>>    6: router.get('/', async (req, res) => {
+       7:   
+                            ^
+
+===== src/server.ts : 12 : 28  TS7016  Could not find a declaration file for module 'opossum'. 'C:/Users/user/desktop/seif/show/backend/node_modules/opossum/index.js' implicitly has an 'any' type. =====
+      11: import { promisify } from 'util'
+>>>   12: import CircuitBreaker from 'opossum';
+      13: import pRetry from 'p-retry';
+                                ^
+
+===== src/server.ts : 146 : 89  TS2339  Property 'message' does not exist on type 'RetryContext'. =====
+     145:     onFailedAttempt: (error) => {
+>>>  146:       console.log(`âš ï¸  ${name} reconnect attempt ${error.attemptNumber} failed: ${error.message}`);
+     147:     },
+                                                                                             ^
+
+===== src/server.ts : 223 : 50  TS6133  'res' is declared but its value is never read. =====
+     222: // ============================================
+>>>  223: function stripCacheHeaders(req: express.Request, res: express.Response, next: express.NextFunction) {
+     224:   delete req.headers['cache-control']
+                                                      ^
+
+===== src/server.ts : 269 : 21  TS6133  'res' is declared but its value is never read. =====
+     268: // Clear body for GET/HEAD
+>>>  269: publicApp.use((req, res, next) => {
+     270:   if (req.method === 'GET' || req.method === 'HEAD') req.body = undefined
+                         ^
+
+===== src/server.ts : 280 : 33  TS6133  'req' is declared but its value is never read. =====
+     279: 
+>>>  280: publicApp.get('/health', async (req, res) => {
+     281:   const allConnected = Object.values(connections).every(c => c.connected)
+                                     ^
+
+===== src/server.ts : 317 : 20  TS6133  'res' is declared but its value is never read. =====
+     316: adminApp.use(express.urlencoded({ extended: true }))
+>>>  317: adminApp.use((req, res, next) => {
+     318:   if (req.method === 'GET' || req.method === 'HEAD') req.body = undefined
+                        ^
+
+===== src/server.ts : 327 : 26  TS6133  'req' is declared but its value is never read. =====
+     326:   
+>>>  327: adminApp.get('/health', (req, res) => {
+     328:   res.json({ status: 'ok', tailscale: true, timestamp: new Date().toISOString() })
+                              ^
+
+===== src/services/auth-service.ts : 135 : 11  TS7006  Parameter 'err' implicitly has an 'any' type. =====
+     134:     JSON.stringify(sessionCache)
+>>>  135:   ).catch(err => console.error('âŒ Redis session caching failed:', err));
+     136: 
+               ^
+
+===== src/services/auth-service.ts : 198 : 13  TS7006  Parameter 'err' implicitly has an 'any' type. =====
+     197:       JSON.stringify(dataToCache)
+>>>  198:     ).catch(err => console.error('âŒ Redis repopulate failed:', err));
+     199: 
+                 ^
+
+===== src/services/translation.service.ts : 79 : 32  TS2339  Property 'data' does not exist on type '{}'. =====
+      78:       const data = await response.json();
+>>>   79:       const translated = data?.data?.translations?.[0]?.translatedText;
+      80:       if (translated && typeof translated === 'string') {
+                                    ^
+
+===== src/services/translation.service.ts : 114 : 32  TS2339  Property 'responseData' does not exist on type '{}'. =====
+     113:       const data = await response.json();
+>>>  114:       const translated = data?.responseData?.translatedText;
+     115:       if (translated && translated !== text) {
+                                    ^
+
+===== src/workers/audit-worker.ts : 10 : 29  TS2351  This expression is not constructable. =====
+       9: 
+>>>   10: const redisConnection = new Redis(process.env.REDIS_URL, {
+      11:   maxRetriesPerRequest: null,
+                                 ^
+
+===== src/workers/export-worker.ts : 56 : 7  TS2304  Cannot find name 'telegramQueue'. =====
+      55:     // After queueing export job
+>>>   56: await telegramQueue.add('notify-admin', {
+      57:   chatId: process.env.ADMIN_TELEGRAM_CHAT_ID,
+           ^
+
+===== src/workers/export-worker.ts : 58 : 56  TS2304  Cannot find name 'req'. =====
+      57:   chatId: process.env.ADMIN_TELEGRAM_CHAT_ID,
+>>>   58:   message: `ðŸ“Š Export job ${job.id} started by admin ${req.user?.email}`
+      59: })
+                                                            ^
+
+===== src/workers/export-worker.ts : 189 : 10  TS2352  Conversion of type 'Buffer' to type 'Buffer<ArrayBufferLike>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first. =====
+     188:   // Generate buffer
+>>>  189:   return await workbook.xlsx.writeBuffer() as Buffer
+     190: }
+              ^

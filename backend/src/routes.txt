@@ -1,0 +1,1093 @@
+
+================================================================================
+FILE: admin\auth.ts
+================================================================================
+// backend/src/routes/admin/auth.ts
+import { Router } from 'express'
+import { z } from 'zod'
+import { randomBytes } from 'crypto'
+import { 
+  login, 
+  register,
+  verify2FACode, 
+  generateToken,
+  generate2FACode,
+  store2FACode,
+  adminExists
+} from '../../services/auth-service.js'
+import { loginSchema, registerSchema, verify2FASchema } from '../../lib/validators/auth.js'
+import { createRateLimiter } from '../../middleware/rate-limit.js'
+import { supabase } from '../../lib/supabase.js'
+import { logAudit } from '../../lib/audit.js'
+import redis from '../../lib/redis.js'
+import { hashPassword } from '../../services/auth-service.js'; 
+import { authenticateToken, AuthenticatedRequest } from '../../middleware/auth.js';
+import { generateFingerprint, extractFromRequest } from '../../lib/security/device-fingerprint.js'
+import { generateAccessToken, generateRefreshToken, refreshAccessToken, revokeAllUserTokens } from '../../services/token-service.js'
+import jwt from 'jsonwebtoken' // Add this if not already imported
+
+const router = Router()
+
+// Rate limits
+const loginLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:admin-login' })
+const registerLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:admin-register' })
+const twoFALimiter = createRateLimiter({ windowMs: 5 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:admin-2fa' })
+const forgotLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:admin-forgot' });
+const resetLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:admin-reset' });
+// POST /api/admin/auth/register
+router.post('/register', registerLimiter, async (req, res, next) => {
+  try {
+    // Check if admin already exists
+    const hasAdmin = await adminExists()
+    if (hasAdmin) {
+      logAudit({
+        action: 'REGISTER_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        metadata: { reason: 'Admin already exists', email: req.body.email }
+      })
+      
+      res.status(403).json({ 
+        error: 'Registration disabled. System already has an administrator.' 
+      })
+      return
+    }
+    
+    // Validate input
+    const validated = registerSchema.parse(req.body)
+    
+    // Create admin account
+    const user = await register({
+      email: validated.email,
+      password: validated.password,
+      role: 'ADMIN'
+    })
+    
+    logAudit({
+      userId: user.id,
+      action: 'REGISTER',
+      resource: 'User',
+      resourceId: user.id,
+      req,
+      success: true,
+      metadata: { email: user.email, role: 'ADMIN' }
+    })
+    
+    res.status(201).json({
+      success: true,
+      user: { id: user.id, email: user.email, role: 'ADMIN' },
+      message: 'Admin account created. You are the system administrator.'
+    })
+    
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      logAudit({
+        action: 'REGISTER_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        metadata: { error: error.errors[0].message, email: req.body.email }
+      })
+      
+      res.status(400).json({ error: error.errors[0].message })
+      return
+    }
+    if (error.message === 'Email already registered') {
+      logAudit({
+        action: 'REGISTER_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        metadata: { reason: 'Email already registered', email: req.body.email }
+      })
+      
+      res.status(409).json({ error: 'Email already registered' })
+      return
+    }
+    next(error)
+  }
+})
+
+// POST /api/admin/auth/login
+router.post('/login', loginLimiter, async (req, res, next) => {
+  try {
+    const validated = loginSchema.parse(req.body)
+    
+    const result = await login(
+      { email: validated.email, password: validated.password },
+      req
+    )
+    
+    if (!result) {
+      logAudit({
+        action: 'LOGIN_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        metadata: { email: validated.email, reason: 'Invalid credentials' }
+      })
+      
+      res.status(401).json({ error: 'Invalid credentials' })
+      return
+    }
+
+    // Check if 2FA is enabled for this user
+    const twoFAEnabled = await is2FAEnabled(result.user.id)
+    
+    // In login endpoint, when 2FA is required
+if (twoFAEnabled) {
+  const sessionId = randomBytes(16).toString('hex')
+  const code = generate2FACode()
+  await store2FACode(sessionId, code)
+  
+  // Store user data for later
+  await redis.setex(
+    `pending:${sessionId}`, 
+    300, // 5 minutes
+    JSON.stringify({
+      userId: result.user.id,
+      email: result.user.email,
+      role: result.user.role
+    })
+  )
+  
+  console.log(`2FA Code for admin ${result.user.email}: ${code}`)
+  
+  res.json({
+    requires2FA: true,
+    sessionId
+  })
+  return
+}
+    
+    // No 2FA - create session directly
+    const token = generateToken({
+      userId: result.user.id,
+      email: result.user.email,
+      role: result.user.role,
+      sessionId: result.sessionId,
+      tailscaleIP: (req as any).tailscaleIP
+    })
+    
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 30 * 60 * 1000
+    })
+    
+    logAudit({
+      userId: result.user.id,
+      action: 'LOGIN',
+      resource: 'User',
+      resourceId: result.user.id,
+      req,
+      success: true,
+      metadata: { email: result.user.email, role: result.user.role }
+    })
+    
+    res.json({
+      success: true,
+      user: result.user,
+      token: token
+    })
+    
+  } catch (error) {
+    next(error)
+  }
+})
+
+// GET /api/admin/auth/me
+router.get('/me', authenticateToken, (req: AuthenticatedRequest, res) => {
+  res.json({ user: req.user });
+});
+
+// POST /api/admin/auth/forgot-password
+router.post('/forgot-password' , forgotLimiter , async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    // Find user (must be an admin)
+    const { data: user, error } = await supabase
+      .from('User')
+      .select('id, email')
+      .eq('email', email)
+      .eq('role', 'ADMIN')
+      .single();
+
+    if (error || !user) {
+      await logAudit({
+        userId: user?.id,
+        action: 'FORGOT_PASSWORD-FAILED',
+        resource: 'User',
+        resourceId: user?.id,
+        req,
+        success: false,
+        metadata: { email }
+      });
+      // Do not reveal whether email exists
+      return res.json({ success: true, message: 'If an account exists, a reset code will be sent.' });
+    }
+
+    // Generate 6‑digit code
+     const resetCode = randomInt(100000, 999999).toString().padStart(6, '0');
+    const expiresAt = Date.now() + 15 * 60 * 1000; // 15 minutes
+
+    // Store in Redis with user info
+    await redis.setex(
+      `reset:${email}:${resetCode}`,   // composite key for uniqueness
+      15 * 60,
+      JSON.stringify({ userId: user.id, email: user.email })
+    );
+
+    // In production, send email via notification service
+    console.log(`[forgot-password] Reset code for ${email}: ${resetCode}`);
+    await logAudit({
+      userId: user?.id,
+      action: 'FORGOT_PASSWORD',
+      resource: 'User',
+      resourceId: user?.id,
+      req,
+      success: true,
+      metadata: { email }
+    });
+    res.json({ success: true, message: 'If an account exists, a reset code will be sent.' });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/admin/auth/reset-password
+router.post('/reset-password', resetLimiter, async (req, res, next) => {
+  try {
+    const { email, code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: 'Email, code, and new password required' });
+    }
+
+    // Retrieve from Redis
+    const key = `reset:${email}:${code}`;
+    const data = await redis.get(key);
+    if (!data) {
+      await logAudit({
+      userId,
+      action: 'RESET_PASSWORD-FAILED',
+      resource: 'User',
+      resourceId: userId,
+      req,
+      success: false,
+      });
+      return res.status(400).json({ error: 'Invalid or expired code' });
+    }
+
+    const { userId } = JSON.parse(data);
+    
+    // Verify user still exists and is admin
+    const { data: user, error: userError } = await supabase
+      .from('User')
+      .select('id')
+      .eq('id', userId)
+      .eq('role', 'ADMIN')
+      .single();
+    
+    if (userError || !user) {
+      await redis.del(key);
+      return res.status(400).json({ error: 'User no longer exists' });
+    }
+    // Hash new password
+    const passwordHash = await hashPassword(newPassword);
+
+    // Update user's password
+    const { error: updateError } = await supabase
+      .from('User')
+      .update({ passwordHash })
+      .eq('id', userId);
+
+    if (updateError) throw updateError;
+
+    // Delete the used code
+    await redis.del(key);
+
+    // Invalidate all sessions for this user (force re-login)
+    await revokeAllUserTokens(userId);
+    await logAudit({
+      userId,
+      action: 'RESET_PASSWORD',
+      resource: 'User',
+      resourceId: userId,
+      req,
+      success: true,
+    });
+    res.json({ success: true, message: 'Password updated successfully. Please log in again.' });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
+// POST /api/admin/auth/verify-2fa
+router.post('/verify-2fa', twoFALimiter, async (req, res, next) => {
+  try {
+    const validated = verify2FASchema.parse(req.body)
+    
+    const valid = await verify2FACode(validated.sessionId, validated.code)
+    
+    if (!valid) {
+      // Log failed verification
+      await logAudit({
+        userId: undefined,
+        action: 'VERIFY_2FA_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        errorMessage: 'Invalid or expired code',
+        metadata: { sessionId: validated.sessionId }
+      });
+      
+      res.status(401).json({ error: 'Invalid or expired code' })
+      return
+    }
+    
+    // Get the pending user data from Redis (store during login)
+    const pendingUserData = await redis.get(`pending:${validated.sessionId}`)
+    if (!pendingUserData) {
+      throw new Error('Session expired or invalid')
+    }
+    
+    const { userId, email, role } = JSON.parse(pendingUserData)
+    
+    // Create session
+    const sessionId = randomBytes(16).toString('hex')
+    const fingerprint = generateFingerprint(extractFromRequest(req))
+    
+    const { data: session, error: sessionError } = await supabase
+      .from('Session')
+      .insert({
+        id: sessionId,
+        userId,
+        deviceFingerprint: fingerprint,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString()
+      })
+      .select()
+      .single()
+    
+    if (sessionError) throw sessionError
+    
+    // Generate access token (15 min)
+    const accessToken = generateAccessToken({
+      userId,
+      email,
+      role,
+      sessionId,
+      tailscaleIP: (req as any).tailscaleIP
+    });
+
+// Generate refresh token (7 days)
+const refreshToken = await generateRefreshToken(userId)
+
+// Set cookie (optional, can use localStorage instead)
+res.cookie('token', accessToken, {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  maxAge: 30 * 60 * 1000
+});
+
+
+// Log success
+await logAudit({
+  userId,
+  action: 'VERIFY_2FA_SUCCESS',
+  resource: 'User',
+  resourceId: userId,
+  req,
+  success: true,
+  metadata: { sessionId: validated.sessionId }
+});
+console.log(`[verify-2fa] Sending 200 response with refreshToken: ${refreshToken ? 'present' : 'missing'}`);
+
+// Return BOTH tokens
+res.json({
+  success: true,
+  token: accessToken,
+  refreshToken: refreshToken,
+  user: { id: userId, email, role }
+});
+    
+  } catch (error) {
+    next(error)
+  }
+})
+
+
+// POST /api/admin/auth/resend-2fa
+router.post('/resend-2fa', async (req, res, next) => {
+  console.log('[resend-2fa] Route hit!');
+  
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId required' });
+    }
+
+    // Check if the sessionId exists in Redis (pending 2FA)
+    const pendingUserData = await redis.get(`pending:${sessionId}`);
+    if (!pendingUserData) {
+      return res.status(404).json({ error: 'Session expired or invalid' });
+    }
+
+    const { email } = JSON.parse(pendingUserData);
+
+    // Generate new 2FA code
+    const newCode = generate2FACode();
+    await store2FACode(sessionId, newCode); // overwrites old code, resets 5 min expiry
+
+    // In production, send email; in dev, log
+    console.log(`[resend-2fa] New code for ${email}: ${newCode}`);
+
+    // Optional: send email via notification service
+    // await sendEmail({ to: email, subject: 'Your new 2FA code', text: `Code: ${newCode}` });
+
+    res.json({ success: true, message: 'New code sent' });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/admin/auth/refresh
+router.post('/refresh', async (req, res, next) => {
+  try {
+    const { refreshToken } = req.body
+    
+    if (!refreshToken) {
+      res.status(400).json({ error: 'Refresh token required' })
+      return
+    }
+    
+    const tokens = await refreshAccessToken(refreshToken, (req as any).tailscaleIP)
+
+    if (!tokens) {
+      res.status(401).json({ error: 'Invalid refresh token' })
+      return
+    }
+    
+    // Log audit
+    await logAudit({
+      userId: tokens.user.id,
+      action: 'TOKEN_REFRESH',
+      resource: 'User',
+      resourceId: tokens.user.id,
+      req,
+      success: true
+    })
+    
+    res.json({
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      user: {
+        id: tokens.user.id,
+        email: tokens.user.email,
+        role: tokens.user.role
+      }
+    })
+    
+  } catch (error) {
+    next(error)
+  }
+})
+
+// POST /api/admin/auth/logout
+router.post('/logout', async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization
+    const token = authHeader?.split(' ')[1]
+    
+    if (token) {
+      // Decode token to get userId
+      const decoded = jwt.decode(token) as any
+      if (decoded?.userId) {
+        await revokeAllUserTokens(decoded.userId)
+      }
+    }
+    
+    res.clearCookie('token')
+    res.json({ success: true })
+    
+  } catch (error) {
+    next(error)
+  }
+})
+
+
+// GET /api/admin/auth/status – public status check (no authentication required)
+router.get('/status', async (req, res) => {
+  try {
+    const token = req.cookies?.token;
+    if (!token) {
+      return res.json({ user: null });
+    }
+
+    // Verify token and session
+    const decoded = verifyToken(token) as any;
+    const valid = await validateSession(decoded.sessionId, req);
+    if (!valid) {
+      res.clearCookie('token');
+      return res.json({ user: null });
+    }
+
+    res.json({
+      user: {
+        id: decoded.userId,
+        email: decoded.email,
+        role: decoded.role,
+      },
+    });
+  } catch (error) {
+    // Token invalid or expired
+    res.clearCookie('token');
+    res.json({ user: null });
+  }
+});
+// Helper to check if 2FA enabled
+async function is2FAEnabled(userId: string): Promise<boolean> {
+  try {
+    const { data: user, error } = await supabase
+      .from('User')
+      .select('twoFactorEnabled')
+      .eq('id', userId)
+      .single()
+    
+    if (error || !user) return false
+    return user.twoFactorEnabled || false
+  } catch {
+    return false
+  }
+}
+
+export default routerimport { Router } from 'express'
+import redis from '../../lib/redis.js'
+import { supabase } from '../../lib/supabase.js'
+
+const router = Router()
+
+/**
+ * GET /api/admin/health
+ * Simple health check. Returns 200 if:
+ * - Request passed Tailscale middleware
+ * - Redis is reachable
+ * - Supabase connection is alive
+ */
+router.get('/', async (req, res) => {
+  try {
+    // Test Redis
+    await redis.ping()
+    
+    // Test Supabase connection by getting server time
+    // This doesn't require any table
+    const { error } = await supabase.from('health_check').select('*').limit(1).maybeSingle()
+    
+    // If error is just "relation does not exist", that's fine - we only care about connection
+    if (error) {
+      // Check if it's a connection error vs table not found error
+      if (error.message.includes('fetch') || 
+          error.message.includes('network') || 
+          error.message.includes('ECONNREFUSED')) {
+        throw error
+      }
+      // Otherwise, table doesn't exist but connection is fine
+      console.log('[Health] Note: health_check table not found, but connection is working')
+    }
+
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString()
+    })
+  } catch (error) {
+    console.error('[Health] Backend unhealthy:', error)
+    res.status(503).json({ error: 'Service unavailable' })
+  }
+})
+
+export default router
+================================================================================
+FILE: admin\index.ts
+================================================================================
+// backend/src/routes/admin/index.ts
+// Aggregate all admin routes (Port 4001, Tailscale-only)
+// Per documentation: backend/src/routes/admin/index.ts
+
+import { Router } from 'express'
+import authRoutes from './auth.js'
+
+import bookingRoutes from './bookings.js'
+import eventRoutes from './events.js'
+import productRoutes from './products.js'
+import exportRoutes from './export.js'
+import settingsRoutes from './settings.js'
+import healthRouter from './health.js'
+
+const router = Router()
+router.use('/auth', authRoutes)
+
+router.use('/bookings', bookingRoutes)
+router.use('/events', eventRoutes)
+router.use('/products', productRoutes)
+router.use('/export', exportRoutes)
+router.use('/settings', settingsRoutes)
+router.use('/health', healthRouter)
+
+export { router as adminRoutes }// backend/src/routes/admin/settings.ts
+import { Router } from 'express'
+import { z } from 'zod'
+import { requireAdmin } from '../../middleware/admin-auth.js'
+import { createRateLimiter } from '../../middleware/rate-limit.js'
+import { supabase } from '../../lib/supabase.js'
+import { logAudit } from '../../lib/audit.js'
+
+const router = Router()
+const settingsLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10, keyPrefix: 'ratelimit:settings' })
+
+router.use(requireAdmin)
+router.use(settingsLimiter)
+
+// GET /api/admin/settings
+router.get('/', async (req, res, next) => {
+  try {
+    // Return current settings (from env or database)
+    const settings = {
+      deleteVerificationCode: process.env.DEFAULT_DELETE_VERIFICATION_CODE || 'ok',
+      adminLockTimeout: parseInt(process.env.ADMIN_LOCK_TIMEOUT_MS || '300000'),
+      jwtExpiry: process.env.JWT_EXPIRES_IN || '30m'
+    }
+    
+    logAudit({
+      userId: req.user?.id,
+      action: 'VIEW_SETTINGS',
+      resource: 'Settings',
+      req,
+      success: true,
+      metadata: { settings: Object.keys(settings) }
+    })
+    
+    res.json(settings)
+    
+  } catch (error) {
+    logAudit({
+      userId: req.user?.id,
+      action: 'VIEW_SETTINGS',
+      resource: 'Settings',
+      req,
+      success: false,
+      errorMessage: error.message
+    })
+    next(error)
+  }
+})
+
+// PUT /api/admin/settings/users/:userId/toggle-2fa
+router.put('/users/:userId/toggle-2fa', async (req, res, next) => {
+  try {
+    const { enabled } = req.body
+    
+    const { data: user, error } = await supabase
+      .from('User')
+      .update({ 
+        twoFactorEnabled: enabled,
+        updatedAt: new Date().toISOString()
+      })
+      .eq('id', req.params.userId)
+      .select()
+      .single()
+    
+    if (error || !user) {
+      res.status(404).json({ error: 'User not found' })
+      return
+    }
+    
+    logAudit({
+      userId: req.user?.id,
+      action: 'UPDATE_SETTINGS',
+      resource: 'User',
+      resourceId: req.params.userId,
+      req,
+      success: true,
+      metadata: { 
+        setting: 'twoFactorEnabled',
+        userId: req.params.userId,
+        userEmail: user.email,
+        previousValue: !enabled,
+        newValue: enabled 
+      }
+    })
+    
+    res.json({ 
+      success: true, 
+      twoFactorEnabled: user.twoFactorEnabled 
+    })
+    
+  } catch (error) {
+    logAudit({
+      userId: req.user?.id,
+      action: 'UPDATE_SETTINGS',
+      resource: 'User',
+      resourceId: req.params.userId,
+      req,
+      success: false,
+      errorMessage: error.message,
+      metadata: { userId: req.params.userId, enabled: req.body.enabled }
+    })
+    next(error)
+  }
+})
+
+// PUT /api/admin/settings/delete-code - Update delete code (requires 2FA)
+router.put('/delete-code', async (req, res, next) => {
+  try {
+    const schema = z.object({
+      newCode: z.string().min(2).max(10),
+      verificationCode: z.string().length(6) // 2FA code required
+    })
+    
+    const validated = schema.parse(req.body)
+    
+    // TODO: Verify 2FA code before allowing change
+    // For now, just update env (in production, store in database)
+    const oldCode = process.env.DEFAULT_DELETE_VERIFICATION_CODE
+    process.env.DEFAULT_DELETE_VERIFICATION_CODE = validated.newCode
+    
+    logAudit({
+      userId: req.user?.id,
+      action: 'UPDATE_SETTINGS',
+      resource: 'Settings',
+      req,
+      success: true,
+      metadata: { 
+        setting: 'deleteVerificationCode',
+        changedBy: req.user?.email,
+        codeChanged: true
+      }
+    })
+    
+    res.json({ success: true, message: 'Delete verification code updated' })
+    
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ error: error.errors[0].message })
+      return
+    }
+    
+    logAudit({
+      userId: req.user?.id,
+      action: 'UPDATE_SETTINGS',
+      resource: 'Settings',
+      req,
+      success: false,
+      errorMessage: error.message,
+      metadata: { setting: 'deleteVerificationCode' }
+    })
+    next(error)
+  }
+})
+
+export default router// backend/src/routes/public/auth.ts
+import { Router } from 'express'
+const router = Router()
+
+// All auth routes moved to admin API (port 4001)
+// This file kept for structure only
+
+export default router
+================================================================================
+FILE: public\bookings.ts
+================================================================================
+// backend/src/routes/public/bookings.ts
+// Public booking routes (Port 4000) - NO AUTH REQUIRED
+// Per documentation: backend/src/routes/public/bookings.ts
+
+import { Router } from 'express'
+import { z } from 'zod'
+import { createBookingSchema } from '../../lib/validators/booking.js'
+import { createRateLimiter } from '../../middleware/rate-limit.js'
+import { supabase } from '../../lib/supabase.js'
+import { encrypt } from '../../lib/encryption.js'
+
+const router = Router()
+
+const bookingLimiter = createRateLimiter({ 
+  windowMs: 60 * 60 * 1000, 
+  maxRequests: 10, 
+  keyPrefix: 'ratelimit:booking' 
+})
+
+// GET /api/public/bookings - NO AUTH (guest can view their bookings by email)
+router.get('/', async (req, res, next) => {
+  try {
+    const email = req.query.email as string
+    
+    if (!email) {
+      res.status(400).json({ error: 'Email required to view bookings' })
+      return
+    }
+    
+    // Find user by email first
+    const { data: user } = await supabase
+      .from('User')
+      .select('id')
+      .eq('email', email)
+      .single()
+    
+    let query = supabase
+      .from('Booking')
+      .select('*, event:Event(titleFr, titleAr, date)')
+      .is('deletedAt', null)
+      .order('createdAt', { ascending: false })
+    
+    // If user exists, filter by userId, otherwise return empty
+    if (user) {
+      query = query.eq('userId', user.id)
+    } else {
+      // Check for guest bookings by email (stored in notes or separate field)
+      // For now, return empty
+      res.json({ bookings: [] })
+      return
+    }
+    
+    const { data: bookings, error } = await query
+    
+    if (error) throw error
+    
+    res.json({ bookings })
+    
+  } catch (error) {
+    next(error)
+  }
+})
+
+// POST /api/public/bookings - NO AUTH (guest booking allowed)
+router.post('/', bookingLimiter, async (req, res, next) => {
+  try {
+    const validated = createBookingSchema.parse(req.body)
+    const guestEmail = req.body.guestEmail as string | undefined
+    const guestName = req.body.guestName as string | undefined
+    
+    // Check event availability
+    const { data: event, error: eventError } = await supabase
+      .from('Event')
+      .select('availableSlots, price')
+      .eq('id', validated.eventId)
+      .is('deletedAt', null)
+      .single()
+    
+    if (eventError || !event) {
+      res.status(404).json({ error: 'Event not found' })
+      return
+    }
+    
+    if (event.availableSlots < validated.childrenCount) {
+      res.status(400).json({ error: 'Not enough available slots' })
+      return
+    }
+    
+    // Calculate total
+    const totalPrice = event.price * validated.childrenCount
+    
+    // Try to find existing user by email
+    let userId = null
+    if (guestEmail) {
+      const { data: user } = await supabase
+        .from('User')
+        .select('id')
+        .eq('email', guestEmail)
+        .single()
+      userId = user?.id || null
+    }
+    
+    // Encrypt notes if provided (store guest info)
+    let notes = validated.notes || ''
+    if (guestEmail && !userId) {
+      // Store guest email in encrypted notes
+      const guestInfo = JSON.stringify({ guestEmail, guestName })
+      notes = notes ? `${notes} | ${guestInfo}` : guestInfo
+    }
+    
+    const encryptedNotes = notes ? encrypt(notes) : null
+    
+    // Create booking
+    const { data: booking, error } = await supabase
+      .from('Booking')
+      .insert({
+        userId, // null for guest bookings
+        eventId: validated.eventId,
+        date: validated.date,
+        childrenCount: validated.childrenCount,
+        totalPrice,
+        status: 'PENDING',
+        paymentStatus: 'PENDING',
+        notes: encryptedNotes
+      })
+      .select()
+      .single()
+    
+    if (error) throw error
+    
+    // Decrement available slots
+    await supabase
+      .from('Event')
+      .update({ availableSlots: event.availableSlots - validated.childrenCount })
+      .eq('id', validated.eventId)
+    
+    res.status(201).json({ 
+      booking,
+      message: userId ? 'Booking confirmed' : 'Guest booking confirmed - please save your booking ID'
+    })
+    
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ error: error.errors[0].message })
+      return
+    }
+    next(error)
+  }
+})
+
+export default router
+================================================================================
+FILE: public\contact.ts
+================================================================================
+// backend/src/routes/public/contact.ts
+// Public contact form (Port 4000)
+// Per documentation: backend/src/routes/public/contact.ts
+
+import { Router } from 'express'
+import { z } from 'zod'
+import { contactSchema } from '../../lib/validators/contact.js'
+import { createRateLimiter } from '../../middleware/rate-limit.js'
+import { supabase } from '../../lib/supabase.js'
+import { encrypt } from '../../lib/encryption.js'
+
+const router = Router()
+
+const contactLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:contact' })
+
+// POST /api/public/contact
+router.post('/', contactLimiter, async (req, res, next) => {
+  try {
+    const validated = contactSchema.parse(req.body)
+    
+    // Encrypt phone if provided
+    const encryptedPhone = validated.phone ? encrypt(validated.phone) : null
+    
+    const { data: message, error } = await supabase
+      .from('Message')
+      .insert({
+        name: validated.name,
+        email: validated.email,
+        phone: encryptedPhone,
+        message: validated.message,
+        status: 'NEW'
+      })
+      .select()
+      .single()
+    
+    if (error) throw error
+    
+    // TODO: Queue notification email (Phase 5)
+    
+    res.status(201).json({ 
+      success: true, 
+      messageId: message.id 
+    })
+    
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ error: error.errors[0].message })
+      return
+    }
+    next(error)
+  }
+})
+
+export default router
+================================================================================
+FILE: public\events.ts
+================================================================================
+
+================================================================================
+FILE: public\index.ts
+================================================================================
+// backend/src/routes/public/index.ts
+// Aggregate all public routes (Port 4000)
+// Per documentation: backend/src/routes/public/index.ts
+
+import { Router } from 'express'
+import bookingRoutes from './bookings.js'
+import productRoutes from './products.js'
+import contactRoutes from './contact.js'
+const router = Router()
+
+router.use('/bookings', bookingRoutes)
+router.use('/products', productRoutes)
+router.use('/contact', contactRoutes)
+
+export { router as publicRoutes }// backend/src/routes/public/products.ts
+// Public product routes (Port 4000) - no auth required
+// Per documentation: backend/src/routes/public/products.ts
+
+import { Router } from 'express'
+import { supabase } from '../../lib/supabase.js'
+
+const router = Router()
+
+// GET /api/public/products
+router.get('/', async (req, res, next) => {
+  try {
+    const category = req.query.category as string | undefined
+    
+    let query = supabase
+      .from('Product')
+      .select('*')
+      .is('deletedAt', null)
+      .gt('stock', 0)
+    
+    if (category) {
+      query = query.eq('category', category)
+    }
+    
+    const { data: products, error } = await query.order('createdAt', { ascending: false })
+    
+    if (error) throw error
+    
+    res.json({ products })
+    
+  } catch (error) {
+    next(error)
+  }
+})
+
+// GET /api/public/products/:id
+router.get('/:id', async (req, res, next) => {
+  try {
+    const { data: product, error } = await supabase
+      .from('Product')
+      .select('*')
+      .eq('id', req.params.id)
+      .is('deletedAt', null)
+      .single()
+    
+    if (error || !product) {
+      res.status(404).json({ error: 'Product not found' })
+      return
+    }
+    
+    res.json({ product })
+    
+  } catch (error) {
+    next(error)
+  }
+})
+
+export default router

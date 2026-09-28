@@ -1,0 +1,261 @@
+
+================================================================================
+FILE: server.ts
+================================================================================
+// backend/src/server.ts
+// Enterprise: Silent connections, state-change-only logging, exponential backoff
+
+import express from 'express'
+import cors from 'cors'
+import helmet from 'helmet'
+import cookieParser from 'cookie-parser'
+import dotenv from 'dotenv'
+import { exec } from 'child_process'
+import { promisify } from 'util'
+
+dotenv.config()
+const execAsync = promisify(exec)
+
+import { publicRoutes } from './routes/public/index.js'
+import { adminRoutes } from './routes/admin/index.js'
+import { validateTailscalePeer } from './middleware/tailscale.js'
+import { errorHandler } from './middleware/error-handler.js'
+import { closeQueues } from './lib/queue.js'
+import redis from './lib/redis.js'
+import { supabase, testSupabaseConnection } from './lib/supabase.js'
+import { createDefaultAdmin } from './services/auth-service.js'
+import { validateRequestSignature } from './middleware/validate-request.js'
+import { attachGeoLocation } from './middleware/geo.js'
+
+const PORT_PUBLIC = parseInt(process.env.PORT_PUBLIC || '4000')
+const PORT_ADMIN = parseInt(process.env.PORT_ADMIN || '4001')
+const NODE_ENV = process.env.NODE_ENV || 'development'
+const PUBLIC_CORS_ORIGIN = process.env.PUBLIC_CORS_ORIGIN?.split(',') || ['http://localhost:3000']
+
+// Admin CORS origins are explicitly set via environment variable (no dynamic additions)
+const ADMIN_CORS_ORIGIN = process.env.ADMIN_CORS_ORIGIN?.split(',') || ['http://localhost:3000']
+
+// ============================================
+// SILENT CONNECTION MANAGER (Enterprise Pattern)
+// ============================================
+
+interface ConnectionState {
+  connected: boolean
+  announced: boolean
+  failCount: number
+}
+
+const connections: Record<string, ConnectionState> = {
+  redis: { connected: false, announced: false, failCount: 0 },
+  supabase: { connected: false, announced: false, failCount: 0 }
+}
+
+const RETRY_BASE_MS = 5000
+const RETRY_MAX_MS = 60000
+
+function getRetryDelay(failCount: number): number {
+  return Math.min(RETRY_BASE_MS * Math.pow(2, failCount), RETRY_MAX_MS)
+}
+
+async function manageConnection(name: string, connectFn: () => Promise<void>, checkFn: () => Promise<boolean>): Promise<void> {
+  const state = connections[name]
+  
+  // Already connected - silent health check
+  if (state.connected) {
+    try {
+      const healthy = await checkFn()
+      if (!healthy) throw new Error('unhealthy')
+      return // Silent success
+    } catch {
+      // Connection lost - announce once
+      state.connected = false
+      state.failCount++
+      if (state.announced) {
+        console.log(`⚠️  ${name} disconnected, will retry in ${getRetryDelay(state.failCount) / 1000}s`)
+        state.announced = false
+      }
+    }
+  }
+  
+  // Try to connect
+  try {
+    await connectFn()
+    state.connected = true
+    state.failCount = 0
+    
+    if (!state.announced) {
+      console.log(`✅ ${name} connected`)
+      state.announced = true
+    }
+  } catch {
+    // Silent fail - schedule retry without logging
+    state.connected = false
+    const delay = getRetryDelay(state.failCount)
+    setTimeout(() => manageConnection(name, connectFn, checkFn), delay)
+  }
+}
+
+function startConnectionManagers(): void {
+  // Redis
+  const manageRedis = () => manageConnection(
+    'redis',
+    async () => { await redis.ping() },
+    async () => { await redis.ping(); return true }
+  )
+  
+  // Supabase
+  const manageSupabase = () => manageConnection(
+    'supabase',
+    async () => { 
+      const ok = await testSupabaseConnection()
+      if (!ok) throw new Error()
+    },
+    async () => await testSupabaseConnection()
+  )
+  
+  // Start all
+  manageRedis()
+  manageSupabase()
+  
+  // Silent health checks every 30s
+  setInterval(() => {
+    manageRedis()
+    manageSupabase()
+  }, 30000)
+}
+
+// ============================================
+// TAILSCALE
+// ============================================
+
+async function getTailscaleIP(): Promise<string> {
+  if (process.env.TAILSCALE_SERVER_IP) {
+    return process.env.TAILSCALE_SERVER_IP
+  }
+  
+  try {
+    const { stdout } = await execAsync('tailscale ip -4')
+    return stdout.trim()
+  } catch {
+    return '127.0.0.1'
+  }
+}
+
+// ============================================
+// SERVERS
+// ============================================
+
+const publicApp = express()
+publicApp.use(helmet())
+publicApp.use(cors({
+  origin: PUBLIC_CORS_ORIGIN,
+  credentials: true,
+  optionsSuccessStatus: 200
+}))
+publicApp.use(express.json({ limit: '10mb' }))
+publicApp.use(express.urlencoded({ extended: true }))
+publicApp.use((req, res, next) => {
+if (req.method === 'GET' || req.method === 'HEAD') {
+req.body = undefined;
+}
+next();
+});
+publicApp.use(cookieParser())
+publicApp.use(validateRequestSignature)
+publicApp.use(attachGeoLocation)
+
+publicApp.get('/health', async (req, res) => {
+  const allConnected = Object.values(connections).every(c => c.connected)
+  res.status(allConnected ? 200 : 503).json({
+    status: allConnected ? 'ok' : 'degraded',
+    timestamp: new Date().toISOString(),
+    connections: Object.fromEntries(Object.entries(connections).map(([k, v]) => [k, v.connected]))
+  })
+})
+
+publicApp.use('/api/public', publicRoutes)
+publicApp.use(errorHandler)
+
+const adminApp = express()
+adminApp.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+}))
+
+// Static CORS for admin API – origins are taken exclusively from environment variable
+adminApp.use(cors({
+  origin: ADMIN_CORS_ORIGIN,
+  credentials: true,
+  optionsSuccessStatus: 200
+}))
+
+adminApp.use(express.json({ limit: '50mb' }))
+adminApp.use(express.urlencoded({ extended: true }))
+adminApp.use((req, res, next) => {
+if (req.method === 'GET' || req.method === 'HEAD') {
+req.body = undefined;
+}
+next();
+});
+
+adminApp.use(cookieParser())
+adminApp.use(validateTailscalePeer)
+adminApp.use(validateRequestSignature)
+adminApp.use(attachGeoLocation)
+
+adminApp.get('/health', (req, res) => {
+  res.json({ status: 'ok', tailscale: true, timestamp: new Date().toISOString() })
+})
+
+adminApp.use('/api/admin', adminRoutes)
+adminApp.use(errorHandler)
+
+// ============================================
+// STARTUP
+// ============================================
+
+async function startServers() {
+  // Auto-create default admin if none exists
+  try {
+    await createDefaultAdmin()
+  } catch (error) {
+    console.error('Failed to create default admin:', error)
+  }
+  
+  startConnectionManagers() 
+   
+  const tailscaleIP = await getTailscaleIP()
+  
+  publicApp.listen(PORT_PUBLIC, '0.0.0.0', () => {  
+    console.log(`✅ Public API: http://localhost:${PORT_PUBLIC}`)
+  })
+  
+  adminApp.listen(PORT_ADMIN, tailscaleIP, () => {
+    console.log(`🔒 Admin API: http://${tailscaleIP}:${PORT_ADMIN}`)
+  })
+  
+  console.log('\n🚀 Servers started')
+  console.log(`📋 Admin CORS allowed origins:`, ADMIN_CORS_ORIGIN)
+}
+
+// ============================================
+// SHUTDOWN
+// ============================================
+
+async function gracefulShutdown(signal: string) {
+  console.log(`\n${signal} received, shutting down...`)
+  try { await closeQueues() } catch {}
+  try { await redis.quit() } catch {}
+  process.exit(0)
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
+
+startServers()

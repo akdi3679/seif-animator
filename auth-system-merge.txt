@@ -1,0 +1,2574 @@
+================================================================================
+FILE: backend\src\routes\admin\auth.ts
+================================================================================
+
+
+// backend/src/routes/admin/auth.ts
+import { Router } from 'express'
+import { z } from 'zod'
+import { randomBytes } from 'crypto'
+import { 
+  login, 
+  register,
+  verify2FACode, 
+  generateToken,
+  generate2FACode,
+  store2FACode,
+  adminExists
+} from '../../services/auth-service.js'
+import { loginSchema, registerSchema, verify2FASchema } from '../../lib/validators/auth.js'
+import { createRateLimiter } from '../../middleware/rate-limit.js'
+import { supabase } from '../../lib/supabase.js'
+import { logAudit } from '../../lib/audit.js'
+import redis from '../../lib/redis.js'
+import { hashPassword } from '../../services/auth-service.js';
+import { sendEmail, send2FACodeEmail } from '../../services/notification-service.js';
+import { authenticateToken, AuthenticatedRequest } from '../../middleware/auth.js';
+import { generateFingerprint, extractFromRequest } from '../../lib/security/device-fingerprint.js'
+import { generateAccessToken, generateRefreshToken, refreshAccessToken, revokeAllUserTokens } from '../../services/token-service.js'
+import jwt from 'jsonwebtoken' // Add this if not already imported
+
+const router = Router()
+
+// Rate limits
+const loginLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:admin-login' })
+const registerLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:admin-register' })
+const twoFALimiter = createRateLimiter({ windowMs: 5 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:admin-2fa' })
+const forgotLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:admin-forgot' });
+const resetLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:admin-reset' });
+const resendLimiter = createRateLimiter({ windowMs: 5 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:admin-resend' });
+// POST /api/admin/auth/register
+router.post('/register', registerLimiter, async (req, res, next) => {
+  try {
+    // Check if admin already exists
+    const hasAdmin = await adminExists()
+    if (hasAdmin) {
+      logAudit({
+        action: 'REGISTER_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        metadata: { reason: 'Admin already exists', email: req.body.email }
+      })
+      
+      res.status(403).json({ 
+        error: 'Registration disabled. System already has an administrator.' 
+      })
+      return
+    }
+    
+    // Validate input
+    const validated = registerSchema.parse(req.body)
+    
+    // Create admin account
+    const user = await register({
+      email: validated.email,
+      password: validated.password,
+      role: 'ADMIN'
+    })
+    
+    logAudit({
+      userId: user.id,
+      action: 'REGISTER',
+      resource: 'User',
+      resourceId: user.id,
+      req,
+      success: true,
+      metadata: { email: user.email, role: 'ADMIN' }
+    })
+    
+    res.status(201).json({
+      success: true,
+      user: { id: user.id, email: user.email, role: 'ADMIN' },
+      message: 'Admin account created. You are the system administrator.'
+    })
+    
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      logAudit({
+        action: 'REGISTER_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        metadata: { error: error.errors[0].message, email: req.body.email }
+      })
+      
+      res.status(400).json({ error: error.errors[0].message })
+      return
+    }
+    if (error.message === 'Email already registered') {
+      logAudit({
+        action: 'REGISTER_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        metadata: { reason: 'Email already registered', email: req.body.email }
+      })
+      
+      res.status(409).json({ error: 'Email already registered' })
+      return
+    }
+    next(error)
+  }
+})
+
+// POST /api/admin/auth/login
+// POST /api/admin/auth/login
+router.post('/login', loginLimiter, async (req, res, next) => {
+  try {
+    let validated;
+    try {
+      validated = loginSchema.parse(req.body);
+    } catch (error) {
+      // Zod validation error – return generic "Invalid credentials"
+      logAudit({
+        action: 'LOGIN_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        metadata: { email: req.body.email, reason: 'Validation failed' }
+      });
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const result = await login(
+      { email: validated.email, password: validated.password },
+      req
+    );
+
+    if (!result) {
+      logAudit({
+        action: 'LOGIN_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        metadata: { email: validated.email, reason: 'Invalid credentials' }
+      });
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Check if 2FA is enabled for this user
+    const twoFAEnabled = await is2FAEnabled(result.user.id);
+
+    if (twoFAEnabled) {
+      const sessionId = randomBytes(16).toString('hex');
+      const code = generate2FACode();
+      const sessionData = {
+        userId: result.user.id,
+        email: result.user.email,
+        role: result.user.role,
+        code,
+        createdAt: Date.now()
+      };
+      await redis.setex(`2fa:${sessionId}`, 900, JSON.stringify(sessionData));
+      await send2FACodeEmail(result.user.email, code);
+
+      return res.json({
+        requires2FA: true,
+        sessionId
+      });
+    }
+
+    // No 2FA - create session directly
+    const token = generateToken({
+      userId: result.user.id,
+      email: result.user.email,
+      role: result.user.role,
+      sessionId: result.sessionId,
+      tailscaleIP: (req as any).tailscaleIP
+    });
+
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 30 * 60 * 1000
+    });
+
+    logAudit({
+      userId: result.user.id,
+      action: 'LOGIN',
+      resource: 'User',
+      resourceId: result.user.id,
+      req,
+      success: true,
+      metadata: { email: result.user.email, role: result.user.role }
+    });
+
+    res.json({
+      success: true,
+      user: result.user,
+      token: token
+    });
+
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/admin/auth/me
+router.get('/me', authenticateToken, (req: AuthenticatedRequest, res) => {
+  res.json({ user: req.user });
+});
+
+// POST /api/admin/auth/forgot-password
+router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
+  try {
+    const { email } = req.body
+    if (!email) return res.status(400).json({ error: 'Email required' })
+
+    const { data: user } = await supabase
+      .from('User')
+      .select('id, email')
+      .eq('email', email)
+      .eq('role', 'ADMIN')
+      .single()
+
+    if (!user) {
+      // Do not reveal existence
+      return res.json({ success: true, message: 'If an account exists, a reset code will be sent.' })
+    }
+
+    const resetCode = generate2FACode()
+    const resetData = { userId: user.id, email: user.email, code: resetCode, createdAt: Date.now() }
+    await redis.setex(`reset:${user.email}`, 900, JSON.stringify(resetData)) // 15 min
+    await sendEmail(user.email, 'Password Reset Code', 'password-reset', { code: resetCode })
+
+    await logAudit({
+      userId: user.id,
+      action: 'FORGOT_PASSWORD',
+      resource: 'User',
+      resourceId: user.id,
+      req,
+      success: true,
+      metadata: { email }
+    })
+    res.json({ success: true, message: 'If an account exists, a reset code will be sent.' })
+  } catch (error) {
+    next(error)
+  }
+})
+
+// POST /api/admin/auth/resend-reset-code
+router.post('/resend-reset-code', resendLimiter, async (req, res, next) => {
+  try {
+    const { email } = req.body
+    if (!email) return res.status(400).json({ error: 'Email required' })
+
+    const data = await redis.get(`reset:${email}`)
+    if (!data) {
+      return res.status(410).json({ error: 'Reset session expired. Please request a new code.' })
+    }
+
+    const resetData = JSON.parse(data)
+    const newCode = generate2FACode()
+    resetData.code = newCode
+    resetData.createdAt = Date.now()
+    await redis.setex(`reset:${email}`, 900, JSON.stringify(resetData))
+    await sendEmail(resetData.email, 'New Password Reset Code', 'password-reset', { code: newCode })
+
+    res.json({ success: true, message: 'New reset code sent' })
+  } catch (error) {
+    next(error)
+  }
+})
+
+
+// POST /api/admin/auth/reset-password
+router.post('/reset-password', resetLimiter, async (req, res, next) => {
+  try {
+    const { email, code, newPassword } = req.body
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: 'Email, code, and new password required' })
+    }
+
+    const data = await redis.get(`reset:${email}`)
+    if (!data) {
+      await logAudit({
+        action: 'RESET_PASSWORD_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        errorMessage: 'Expired session',
+        metadata: { email }
+      })
+      return res.status(410).json({ error: 'Reset session expired. Please request a new code.' })
+    }
+
+    const { userId, code: storedCode } = JSON.parse(data)
+    if (code !== storedCode) {
+      await logAudit({
+        action: 'RESET_PASSWORD_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        errorMessage: 'Invalid code',
+        metadata: { email }
+      })
+      return res.status(401).json({ error: 'Invalid code' })
+    }
+
+    const passwordHash = await hashPassword(newPassword)
+    const { error: updateError } = await supabase
+      .from('User')
+      .update({ passwordHash, updatedAt: new Date().toISOString() })
+      .eq('id', userId)
+    if (updateError) throw updateError
+
+    await redis.del(`reset:${email}`)
+    await revokeAllUserTokens(userId)
+
+    await logAudit({
+      userId,
+      action: 'RESET_PASSWORD',
+      resource: 'User',
+      resourceId: userId,
+      req,
+      success: true
+    })
+    res.json({ success: true, message: 'Password updated. Please log in again.' })
+  } catch (error) {
+    next(error)
+  }
+})
+
+
+// POST /api/admin/auth/verify-2fa
+router.post('/verify-2fa', twoFALimiter, async (req, res, next) => {
+  try {
+    const validated = verify2FASchema.parse(req.body)
+
+    const data = await redis.get(`2fa:${validated.sessionId}`)
+    if (!data) {
+      await logAudit({
+        action: 'VERIFY_2FA_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        errorMessage: 'Session expired',
+        metadata: { sessionId: validated.sessionId }
+      })
+      return res.status(410).json({ error: '2FA session expired. Please login again.' })
+    }
+
+    const { userId, email, role, code, createdAt } = JSON.parse(data)
+
+    // 🆕 Check if code is older than 5 minutes (300,000 ms)
+    if (Date.now() - createdAt > 300000) {
+      await logAudit({
+        action: 'VERIFY_2FA_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        errorMessage: 'Code expired',
+        metadata: { sessionId: validated.sessionId }
+      })
+      return res.status(401).json({ error: 'Code expired. Please request a new one.' })
+    }
+
+    if (code !== validated.code) {
+      await logAudit({
+        action: 'VERIFY_2FA_FAILED',
+        resource: 'User',
+        req,
+        success: false,
+        errorMessage: 'Invalid code',
+        metadata: { sessionId: validated.sessionId }
+      })
+      return res.status(401).json({ error: 'Invalid code' })
+    }
+
+    // Delete the 2fa key (optional – you may keep it but usually it's one‑time)
+    await redis.del(`2fa:${validated.sessionId}`)
+    // Create session
+    const sessionId = randomBytes(16).toString('hex')
+    const fingerprint = generateFingerprint(extractFromRequest(req))
+    const { error: sessionError } = await supabase
+      .from('Session')
+      .insert({
+        id: sessionId,
+        userId,
+        deviceFingerprint: fingerprint,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString()
+      })
+    if (sessionError) throw sessionError
+
+    const accessToken = generateAccessToken({
+      userId,
+      email,
+      role,
+      sessionId,
+      tailscaleIP: (req as any).tailscaleIP
+    })
+    const refreshToken = await generateRefreshToken(userId)
+    res.cookie('token', accessToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 30 * 60 * 1000
+    })
+
+    await logAudit({
+      userId,
+      action: 'VERIFY_2FA_SUCCESS',
+      resource: 'User',
+      resourceId: userId,
+      req,
+      success: true,
+      metadata: { sessionId: validated.sessionId }
+    })
+
+    res.json({
+      success: true,
+      token: accessToken,
+      refreshToken,
+      user: { id: userId, email, role }
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+
+// POST /api/admin/auth/resend-2fa
+router.post('/resend-2fa', resendLimiter, async (req, res, next) => {
+  try {
+    const { sessionId } = req.body
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId required' })
+    }
+
+    const data = await redis.get(`2fa:${sessionId}`)
+    if (!data) {
+      return res.status(410).json({ error: '2FA session expired. Please login again.' })
+    }
+
+    const sessionData = JSON.parse(data)
+    const newCode = generate2FACode()
+    sessionData.code = newCode
+    sessionData.createdAt = Date.now()
+    await redis.setex(`2fa:${sessionId}`, 900, JSON.stringify(sessionData))
+    await send2FACodeEmail(sessionData.email, newCode)
+
+    res.json({ success: true, message: 'New code sent' })
+  } catch (error) {
+    next(error)
+  }
+})
+
+// POST /api/admin/auth/refresh
+router.post('/refresh', async (req, res, next) => {
+  try {
+    const { refreshToken } = req.body
+    
+    if (!refreshToken) {
+      res.status(400).json({ error: 'Refresh token required' })
+      return
+    }
+    
+    const tokens = await refreshAccessToken(refreshToken, (req as any).tailscaleIP)
+
+    if (!tokens) {
+      res.status(401).json({ error: 'Invalid refresh token' })
+      return
+    }
+    
+    // Log audit
+    await logAudit({
+      userId: tokens.user.id,
+      action: 'TOKEN_REFRESH',
+      resource: 'User',
+      resourceId: tokens.user.id,
+      req,
+      success: true
+    })
+    
+    res.json({
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      user: {
+        id: tokens.user.id,
+        email: tokens.user.email,
+        role: tokens.user.role
+      }
+    })
+    
+  } catch (error) {
+    next(error)
+  }
+})
+
+// POST /api/admin/auth/logout
+router.post('/logout', async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization
+    const token = authHeader?.split(' ')[1]
+    
+    if (token) {
+      // Decode token to get userId
+      const decoded = jwt.decode(token) as any
+      if (decoded?.userId) {
+        await revokeAllUserTokens(decoded.userId)
+      }
+    }
+    
+    res.clearCookie('token')
+    res.json({ success: true })
+    
+  } catch (error) {
+    next(error)
+  }
+})
+
+
+// GET /api/admin/auth/status – public status check (no authentication required)
+router.get('/status', async (req, res) => {
+  try {
+    const token = req.cookies?.token;
+    if (!token) {
+      return res.json({ user: null });
+    }
+
+    // Verify token and session
+    const decoded = verifyToken(token) as any;
+    const valid = await validateSession(decoded.sessionId, req);
+    if (!valid) {
+      res.clearCookie('token');
+      return res.json({ user: null });
+    }
+
+    res.json({
+      user: {
+        id: decoded.userId,
+        email: decoded.email,
+        role: decoded.role,
+      },
+    });
+  } catch (error) {
+    // Token invalid or expired
+    res.clearCookie('token');
+    res.json({ user: null });
+  }
+});
+// Helper to check if 2FA enabled
+async function is2FAEnabled(userId: string): Promise<boolean> {
+  try {
+    const { data: user, error } = await supabase
+      .from('User')
+      .select('twoFactorEnabled')
+      .eq('id', userId)
+      .single()
+    
+    if (error || !user) return false
+    return user.twoFactorEnabled || false
+  } catch {
+    return false
+  }
+}
+
+export default router
+================================================================================
+FILE: backend\src\services\auth-service.ts
+================================================================================
+
+
+// backend/src/services/auth-service.ts
+// Login, register, 2FA, password reset
+// Per documentation: backend/src/services/auth-service.ts
+
+import bcrypt from 'bcrypt'
+import jwt from 'jsonwebtoken'
+import { authenticator } from 'otplib'
+import { randomBytes } from 'crypto'
+import redis from '../lib/redis.js'
+import { supabase } from '../lib/supabase.js' 
+import { generateFingerprint, extractFromRequest } from '../lib/security/device-fingerprint.js'
+import { encrypt } from '../lib/encryption.js'
+import { randomInt } from 'crypto';
+
+const JWT_SECRET = process.env.JWT_SECRET!
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '30m'
+const BCRYPT_ROUNDS = 12
+
+export interface LoginCredentials {
+  email: string
+  password: string
+}
+
+export interface RegisterData {
+  email: string
+  password: string
+  role?: 'USER' | 'ADMIN'
+}
+
+export interface SessionData {
+  userId: string
+  deviceFingerprint: string
+  ipAddress: string
+  geoLocation?: { city: string; country: string; lat: number; lon: number }
+  userAgent: string
+}
+
+// Hash password with bcrypt (12 rounds per documentation)
+export async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, BCRYPT_ROUNDS)
+}
+
+// Verify password
+export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(password, hash)
+}
+
+// Generate JWT token
+export function generateToken(payload: object): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN })
+}
+
+// Verify JWT token
+export function verifyToken(token: string): any {
+  return jwt.verify(token, JWT_SECRET)
+}
+
+// Generate 2FA TOTP secret
+export function generate2FASecret(): string {
+  return authenticator.generateSecret()
+}
+
+// Verify 2FA TOTP code
+export function verify2FAToken(token: string, secret: string): boolean {
+  return authenticator.verify({ token, secret })
+}
+
+// Generate 6-digit 2FA code (for email)
+export function generate2FACode(): string {
+  return randomInt(100000, 999999).toString().padStart(6, '0');
+}
+
+// Store 2FA code in Redis (5 min expiry)
+export async function store2FACode(sessionId: string, code: string): Promise<void> {
+  await redis.setex(`2fa:${sessionId}`, 300, code) // 5 minutes
+}
+
+// Verify 2FA code from Redis
+export async function verify2FACode(sessionId: string, code: string): Promise<boolean> {
+  const stored = await redis.get(`2fa:${sessionId}`)
+  if (!stored) return false
+  
+  const valid = stored === code
+  if (valid) {
+    await redis.del(`2fa:${sessionId}`) // Delete after use
+  }
+  return valid
+}
+
+// Create session in database
+export async function createSession(data: SessionData & { expiresAt: Date }): Promise<string> {
+  const { data: session, error } = await supabase
+    .from('Session')
+    .insert({
+      userId: data.userId,
+      deviceFingerprint: data.deviceFingerprint,
+      ipAddress: data.ipAddress,
+      geoLocation: data.geoLocation ? JSON.stringify(data.geoLocation) : null,
+      userAgent: data.userAgent,
+      expiresAt: data.expiresAt.toISOString()
+    })
+    .select('id')
+    .single()
+  
+  if (error) {
+    console.error('Error creating session:', error)
+    throw new Error('Failed to create session')
+  }
+  
+  return session.id
+}
+
+export async function validateSession(sessionId: string, request: any): Promise<boolean> {
+  console.log('[Session Validation] Checking session:', sessionId)
+  
+  const { data: session, error } = await supabase
+    .from('Session')
+    .select(`
+      id,
+      deviceFingerprint,
+      ipAddress,
+      userAgent,
+      expiresAt,
+      user:userId (
+        id,
+        email,
+        role,
+        twoFactorEnabled
+      )
+    `)
+    .eq('id', sessionId)
+    .single()
+  
+  if (error || !session) {
+    console.log('[Session Validation] Session not found or error:', error)
+    return false
+  }
+  
+  if (new Date(session.expiresAt) < new Date()) {
+    console.log('[Session Validation] Session expired')
+    return false
+  }
+  
+  // Extract current request characteristics
+  const currentFingerprint = generateFingerprint(extractFromRequest(request))
+  const currentIP = request.ip || request.headers['x-forwarded-for']
+  const currentUA = request.headers['user-agent']
+  
+  console.log('[Session Validation]', {
+    storedFingerprint: session.deviceFingerprint,
+    currentFingerprint,
+    storedIP: session.ipAddress,
+    currentIP,
+    storedUA: session.userAgent,
+    currentUA
+  })
+  
+  // For admin users: strict validation
+  if (session.user?.role === 'ADMIN') {
+    const checks = {
+      fingerprint: session.deviceFingerprint === currentFingerprint,
+      ip: session.ipAddress === currentIP,
+      userAgent: session.userAgent === currentUA
+    }
+    
+    console.log('[Session Validation] Admin checks:', checks)
+    
+    if (Object.values(checks).includes(false)) {
+      console.log('[Session Validation] FAILED - logging out user')
+      await logoutUser(session.user.id)
+      return false
+    }
+  }
+  
+  console.log('[Session Validation] PASSED')
+  return true
+}
+
+// Login user
+export async function login(credentials: LoginCredentials, req: any): Promise<{ user: any; requires2FA: boolean; sessionId?: string } | null> {
+  const { data: user, error } = await supabase
+    .from('User')
+    .select('*')
+    .eq('email', credentials.email)
+    .single()
+  
+  if (error || !user) return null
+  
+  const validPassword = await verifyPassword(credentials.password, user.passwordHash)
+  if (!validPassword) return null
+  
+  // Check if 2FA required
+  const requires2FA = user.role === 'ADMIN' && await is2FAEnabled(user.id)
+
+  if (requires2FA) {
+    // Generate and store 2FA code
+    const sessionId = randomBytes(16).toString('hex')
+    const code = generate2FACode()
+    await store2FACode(sessionId, code)
+    console.log(`2FA Code for ${user.email}: ${code}`) // Dev only
+    return { 
+      user: { id: user.id, email: user.email, role: user.role }, 
+      requires2FA: true, 
+      sessionId 
+    }
+  }
+  
+  // Create session directly
+  const fingerprint = generateFingerprint(extractFromRequest(req))
+  const sessionId = await createSession({
+    userId: user.id,
+    deviceFingerprint: fingerprint,
+    ipAddress: req.ip,
+    geoLocation: (req as any).geoLocation, 
+    userAgent: req.headers['user-agent'],
+    expiresAt: new Date(Date.now() + 30 * 60 * 1000) // 30 min
+  })
+  
+  // Update last login
+  await supabase
+    .from('User')
+    .update({ lastLoginAt: new Date().toISOString() })
+    .eq('id', user.id)
+  
+  return { user, requires2FA: false, sessionId }
+}
+
+// Check if 2FA is enabled for user
+async function is2FAEnabled(userId: string): Promise<boolean> {
+  try {
+    const { data: user, error } = await supabase
+      .from('User')
+      .select('twoFactorEnabled')
+      .eq('id', userId)
+      .single()
+    
+    if (error || !user) return false
+    return user.twoFactorEnabled || false
+  } catch {
+    return false
+  }
+}
+
+// Check if any admin exists
+export async function adminExists(): Promise<boolean> {
+  const { data: admin, error } = await supabase
+    .from('User')
+    .select('id')
+    .eq('role', 'ADMIN')
+    .limit(1)
+  
+  if (error) return false
+  return admin && admin.length > 0
+}
+
+// Delete user by email (for admin creation cleanup)
+export async function deleteUserByEmail(email: string): Promise<void> {
+  await supabase
+    .from('User')
+    .delete()
+    .eq('email', email)
+}
+
+// Create default admin if none exists
+export async function createDefaultAdmin(): Promise<void> {
+  // Check if any admin exists
+  const { data: existingAdmin, error: checkError } = await supabase
+    .from('User')
+    .select('id')
+    .eq('role', 'ADMIN')
+    .limit(1)
+  
+  if (checkError) {
+    console.error('Error checking for existing admin:', checkError)
+    return
+  }
+  
+  if (existingAdmin && existingAdmin.length > 0) {
+    console.log('✅ Admin already exists, skipping default admin creation')
+    return
+  }
+  
+  console.log('🔧 No admin found. Creating default admin...')
+  
+  // Check if a user with admin email already exists (as USER)
+  const { data: existingUser } = await supabase
+    .from('User')
+    .select('id, role')
+    .eq('email', 'admin@myshow.tn')
+    .single()
+  
+  const passwordHash = await hashPassword('admin123')
+  
+  if (existingUser) {
+    // Upgrade existing user to ADMIN
+    const { error: updateError } = await supabase
+      .from('User')
+      .update({ 
+        role: 'ADMIN',
+        passwordHash: passwordHash,
+        updatedAt: new Date().toISOString()
+      })
+      .eq('email', 'admin@myshow.tn')
+    
+    if (updateError) {
+      console.error('Failed to upgrade user to admin:', updateError)
+      return
+    }
+    
+    console.log('✅ Existing user upgraded to ADMIN: admin@myshow.tn / admin123')
+    console.log('⚠️  Change password immediately after first login!')
+    return
+  }
+  
+  // Create new admin
+  const { error: createError } = await supabase
+    .from('User')
+    .insert({
+      email: 'admin@myshow.tn',
+      passwordHash: passwordHash,
+      role: 'ADMIN',
+      twoFactorEnabled: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    })
+  
+  if (createError) {
+    console.error('Failed to create default admin:', createError)
+    return
+  }
+  
+  console.log('✅ Default admin created: admin@myshow.tn / admin123')
+  console.log('⚠️  Change password immediately after first login!')
+}
+
+// Register user
+export async function register(data: RegisterData): Promise<any> {
+  const { data: existing, error: checkError } = await supabase
+    .from('User')
+    .select('id')
+    .eq('email', data.email)
+    .single()
+  
+  if (existing) {
+    throw new Error('Email already registered')
+  }
+  
+  const passwordHash = await hashPassword(data.password)
+  
+  const { data: user, error } = await supabase
+    .from('User')
+    .insert({
+      email: data.email,
+      passwordHash,
+      role: data.role || 'USER',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    })
+    .select('id, email, role')
+    .single()
+  
+  if (error) {
+    console.error('Error creating user:', error)
+    throw new Error('Failed to create user')
+  }
+  
+  return user
+}
+
+// Logout user (delete all sessions)
+export async function logoutUser(userId: string): Promise<void> {
+  const { error } = await supabase
+    .from('Session')
+    .delete()
+    .eq('userId', userId)
+  
+  if (error) {
+    console.error('Error deleting sessions:', error)
+    throw new Error('Failed to logout user')
+  }
+}
+
+// Check if 2FA should be required
+async function shouldRequire2FA(userId: string, req: any): Promise<boolean> {
+  // New device (no existing session with this fingerprint)
+  const fingerprint = generateFingerprint(extractFromRequest(req))
+  
+  const { data: existingSession } = await supabase
+    .from('Session')
+    .select('id')
+    .eq('userId', userId)
+    .eq('deviceFingerprint', fingerprint)
+    .limit(1)
+    .single()
+  
+  if (!existingSession) return true
+  
+  // Last login > 30 days
+  const { data: user } = await supabase
+    .from('User')
+    .select('lastLoginAt')
+    .eq('id', userId)
+    .single()
+  
+  if (user?.lastLoginAt) {
+    const daysSinceLogin = (Date.now() - new Date(user.lastLoginAt).getTime()) / (1000 * 60 * 60 * 24)
+    if (daysSinceLogin > 30) return true
+  }
+  
+  return false
+}
+================================================================================
+FILE: backend\src\services\token-service.ts
+================================================================================
+
+
+import jwt from 'jsonwebtoken'
+import bcrypt from 'bcrypt'
+import { randomBytes } from 'crypto'
+import { supabase } from '../lib/supabase.js'
+
+const JWT_SECRET = process.env.JWT_SECRET!
+const ACCESS_TOKEN_EXPIRY = '15m' // 15 minutes
+const REFRESH_TOKEN_EXPIRY = 7 * 24 * 60 * 60 * 1000 // 7 days
+
+export interface TokenPayload {
+  userId: string
+  email: string
+  role: string
+  sessionId: string
+  tailscaleIP?: string
+}
+
+// Generate access token (short-lived)
+export function generateAccessToken(payload: TokenPayload): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY })
+}
+
+// Generate refresh token (long-lived, one-time use)
+export async function generateRefreshToken(userId: string): Promise<string> {
+  // Generate random token
+  const refreshToken = randomBytes(40).toString('hex')
+  
+  // Hash it for storage (never store raw tokens)
+  const hashedToken = await bcrypt.hash(refreshToken, 10)
+  
+  // Store in database
+  const { error } = await supabase.from('RefreshToken').insert({
+    userId,
+    token: hashedToken,
+    expiresAt: new Date(Date.now() + REFRESH_TOKEN_EXPIRY).toISOString(),
+    createdAt: new Date().toISOString()
+  })
+  
+  if (error) throw error
+  
+  return refreshToken
+}
+
+// Verify and refresh access token
+export async function refreshAccessToken(
+    refreshToken: string, 
+    tailscaleIP?: string
+  ): Promise<{
+  accessToken: string
+  refreshToken: string
+  user: any
+} | null> {
+  // Find all valid refresh tokens for this user
+  const { data: tokens, error } = await supabase
+    .from('RefreshToken')
+    .select('*, user:User(*)')
+    .gte('expiresAt', new Date().toISOString())
+    .is('revokedAt', null)
+  
+  if (error || !tokens?.length) return null
+  
+  // Find matching token (compare with bcrypt)
+  let validToken = null
+  for (const token of tokens) {
+    const isValid = await bcrypt.compare(refreshToken, token.token)
+    if (isValid) {
+      validToken = token
+      break
+    }
+  }
+  
+  if (!validToken) return null
+  
+  // Revoke the used token (one-time use)
+  await supabase
+    .from('RefreshToken')
+    .update({ revokedAt: new Date().toISOString() })
+    .eq('id', validToken.id)
+  
+  // Generate new tokens
+  const payload = {
+    userId: validToken.user.id,
+    email: validToken.user.email,
+    role: validToken.user.role,
+    sessionId: randomBytes(16).toString('hex'),
+    tailscaleIP: tailscaleIP // use passed value
+  }
+  const newAccessToken = generateAccessToken(payload)
+  const newRefreshToken = await generateRefreshToken(validToken.user.id)
+  
+  return {
+    accessToken: newAccessToken,
+    refreshToken: newRefreshToken,
+    user: validToken.user
+  }
+}
+
+// Revoke all refresh tokens for a user (logout)
+export async function revokeAllUserTokens(userId: string): Promise<void> {
+  await supabase
+    .from('RefreshToken')
+    .update({ revokedAt: new Date().toISOString() })
+    .eq('userId', userId)
+}
+================================================================================
+FILE: backend\src\services\notification-service.ts
+================================================================================
+
+
+// backend/src/services/notification-service.ts
+import { emailQueue, telegramQueue, EmailJobData, TelegramJobData } from '../lib/queue.js'
+
+export async function sendEmail(
+  to: string,
+  subject: string,
+  template: EmailJobData['template'],
+  data: Record<string, any>
+): Promise<void> {
+  await emailQueue.add('send-email', { to, subject, template, data })
+}
+
+export async function sendTelegram(
+  chatId: string,
+  message: string,
+  parseMode?: 'HTML' | 'Markdown'
+): Promise<void> {
+  await telegramQueue.add('send-telegram', { chatId, message, parseMode })
+}
+
+// Convenience methods for common notifications
+export async function send2FACodeEmail(email: string, code: string): Promise<void> {
+  await sendEmail(email, 'Your 2FA Code', '2fa-code', { code })
+}
+
+export async function sendExportReadyEmail(email: string, downloadUrl: string): Promise<void> {
+  await sendEmail(email, 'Your Export is Ready', 'export-ready', { downloadUrl })
+}
+================================================================================
+FILE: backend\src\middleware\auth.ts
+================================================================================
+
+
+// backend/src/middleware/auth.ts
+// JWT validation and session integrity
+// Per documentation: backend/src/middleware/auth.ts
+
+import { Request, Response, NextFunction } from 'express'
+import { verifyToken, validateSession } from '../services/auth-service.js'
+
+export interface AuthenticatedRequest extends Request {
+  user?: {
+    id: string
+    email: string
+    role: 'USER' | 'ADMIN'
+    sessionId: string
+  }
+}
+
+// Validate JWT and session
+export async function authenticateToken(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '')
+    
+    if (!token) {
+      res.status(401).json({ error: 'Access denied' })
+      return
+    }
+    
+    // Verify JWT
+    const decoded = verifyToken(token) as any
+    
+    // Validate session integrity
+    const valid = await validateSession(decoded.sessionId, req)
+    if (!valid) {
+      res.status(401).json({ error: 'Session invalid' })
+      return
+    }
+    
+    // Attach user to request
+    req.user = {
+      id: decoded.userId,
+      email: decoded.email,
+      role: decoded.role,
+      sessionId: decoded.sessionId
+    }
+    
+    next()
+    
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token' })
+  }
+}
+
+// Require admin role
+export function requireAdmin(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): void {
+  if (req.user?.role !== 'ADMIN') {
+    res.status(403).json({ error: 'Admin access required' })
+    return
+  }
+  next()
+}
+================================================================================
+FILE: backend\src\middleware\validate-request.ts
+================================================================================
+
+
+// backend/src/middleware/validate-request.ts
+// HMAC-SHA256 request signature verification (bank‑level security)
+// Per documentation: backend/src/middleware/validate-request.ts
+
+import { Request, Response, NextFunction } from 'express'
+import { createHmac, timingSafeEqual } from 'crypto'
+
+const SIGNATURE_SECRET = process.env.REQUEST_SIGNATURE_SECRET || process.env.JWT_SECRET
+if (!SIGNATURE_SECRET) {
+  throw new Error('REQUEST_SIGNATURE_SECRET or JWT_SECRET must be set')
+}
+
+export async function validateRequestSignature(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  if (req.path === '/health' ||
+      req.path.startsWith('/api/public/auth/') || req.path === '/api/admin/health'  || req.path === '/api/admin/auth/status' ) {
+    return next();
+  }
+  try {
+    // 1. Extract required headers
+    const signature = req.headers['x-request-signature'] as string
+    const timestamp = req.headers['x-request-timestamp'] as string
+    const fingerprint = req.headers['x-device-fingerprint'] as string
+
+    if (!signature || !timestamp) {
+      res.status(401).json({ error: 'Missing signature headers' })
+      return
+    }
+
+    // 2. Prevent replay attacks (5 min window)
+    const now = Date.now()
+    const requestTime = parseInt(timestamp, 10)
+
+    const maxAge = process.env.NODE_ENV === 'production' ? 5 * 60 * 1000 : 10 * 60 * 1000; // 10 min in dev
+
+    if (isNaN(requestTime) || Math.abs(now - requestTime) > maxAge) {
+      res.status(401).json({ error: 'Request expired or invalid timestamp' })
+      return
+    }
+
+    // 3. Build the string that was signed (must match frontend)
+    const method = req.method
+    const path = req.originalUrl || req.url
+    const body = JSON.stringify(req.body) || ''
+    const dataToSign = `${method}:${path}:${timestamp}:${fingerprint || ''}:${body}`
+
+    // 4. Compute expected signature
+    const expectedSignature = createHmac('sha256', SIGNATURE_SECRET)
+      .update(dataToSign)
+      .digest('hex')
+    console.log('--- Signature Debug ---');
+    console.log('Method:', method);
+    console.log('Path:', path);
+    console.log('Timestamp:', timestamp);
+    console.log('Fingerprint:', fingerprint);
+    console.log('🔑 Backend secret (first 4):', SIGNATURE_SECRET.substring(0, 4));
+    console.log('Body:', body);
+    console.log('Data to sign:', dataToSign);
+    console.log('Expected signature:', expectedSignature);
+    console.log('Received signature:', signature);
+    // 5. Timing‑safe comparison
+    const sigBuffer = Buffer.from(signature, 'hex')
+    const expBuffer = Buffer.from(expectedSignature, 'hex')
+
+    if (sigBuffer.length !== expBuffer.length ||
+        !timingSafeEqual(sigBuffer, expBuffer)) {
+      res.status(401).json({ error: 'Invalid signature' })
+      return
+    }
+
+    // 6. Attach validated fingerprint for later use (optional)
+    ;(req as any).validatedFingerprint = fingerprint
+
+    next()
+  } catch (error) {
+    // Log error but don't expose details to client
+    console.error('Signature validation error:', error)
+    res.status(500).json({ error: 'Signature validation failed' })
+  }
+}
+================================================================================
+FILE: backend\src\middleware\rate-limit.ts
+================================================================================
+
+
+// backend/src/middleware/rate-limit.ts
+// Simplified rate limiting (mock Redis compatible)
+
+import { Request, Response, NextFunction } from 'express'
+import redis from '../lib/redis.js'
+
+interface RateLimitConfig {
+  windowMs: number
+  maxRequests: number
+  keyPrefix: string
+}
+
+const DEFAULT_CONFIG: RateLimitConfig = {
+  windowMs: 15 * 60 * 1000,
+  maxRequests: 100,
+  keyPrefix: 'ratelimit'
+}
+
+const ENDPOINT_LIMITS: Record<string, RateLimitConfig> = {
+  '/api/public/auth/login': { windowMs: 15 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:login' },
+  '/api/public/auth/register': { windowMs: 60 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:register' },
+  '/api/public/auth/verify-2fa': { windowMs: 5 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:2fa' },
+  '/api/public/bookings': { windowMs: 60 * 60 * 1000, maxRequests: 10, keyPrefix: 'ratelimit:booking' },
+  '/api/public/contact': { windowMs: 60 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:contact' }
+}
+
+export function createRateLimiter(config: Partial<RateLimitConfig> = {}) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const finalConfig = { ...DEFAULT_CONFIG, ...config }
+    const endpointConfig = ENDPOINT_LIMITS[req.path] || finalConfig
+    
+    const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown'
+    const fingerprint = req.headers['x-device-fingerprint'] || 'unknown'
+    const key = `${endpointConfig.keyPrefix}:${ip}:${fingerprint}`
+    
+    try {
+      // Simple increment (works with mock Redis)
+      const current = await redis.get(key)
+      const count = current ? parseInt(current, 10) : 0
+      
+      if (count >= endpointConfig.maxRequests) {
+        res.status(429).json({
+          error: 'Too many requests',
+          retryAfter: Math.ceil(endpointConfig.windowMs / 1000)
+        })
+        return
+      }
+      
+      // Increment and set expiry (simple version)
+      await redis.set(key, (count + 1).toString())
+      await redis.expire(key, Math.ceil(endpointConfig.windowMs / 1000))
+      res.setHeader('X-RateLimit-Limit', endpointConfig.maxRequests.toString())
+      res.setHeader('X-RateLimit-Remaining', (endpointConfig.maxRequests - count - 1).toString())
+      
+      next()
+      
+    } catch (error) {
+      // Fail open
+      next()
+    }
+  }
+}
+================================================================================
+FILE: backend\src\middleware\tailscale.ts
+================================================================================
+
+
+import { Request, Response, NextFunction } from 'express'
+import { getTailscalePeers, isTailscaleIP } from '../lib/tailscale.js'
+
+export async function validateTailscalePeer(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    // 1. Validate the immediate source IP (frontend server)
+    const sourceIP = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim()
+                     || req.socket.remoteAddress
+                     || req.ip
+    const strippedSource = sourceIP.replace(/^::ffff:/, '')
+
+    if (!strippedSource || !isTailscaleIP(strippedSource)) {
+      console.log('[Tailscale] Source IP not Tailscale:', strippedSource)
+      return res.status(404).json({ error: 'Not found' })
+    }
+
+    const peers = await getTailscalePeers()
+    if (!peers.includes(strippedSource)) {
+      console.log('[Tailscale] Source IP not in peer list:', strippedSource)
+      return res.status(404).json({ error: 'Not found' })
+    }
+
+    // 2. Validate the forwarded client IP (end user)
+    const clientIP = req.headers['x-forwarded-for'] as string
+    if (!clientIP) {
+      console.log('[Tailscale] Missing X-Forwarded-For header')
+      return res.status(404).json({ error: 'Not found' })
+    }
+
+    const strippedClient = clientIP.split(',')[0].trim().replace(/^::ffff:/, '')
+    if (!strippedClient || !isTailscaleIP(strippedClient)) {
+      console.log('[Tailscale] Client IP not Tailscale:', strippedClient)
+      return res.status(404).json({ error: 'Not found' })
+    }
+
+    if (!peers.includes(strippedClient)) {
+      console.log('[Tailscale] Client IP not in peer list:', strippedClient)
+      return res.status(404).json({ error: 'Not found' })
+    }
+
+    // Both IPs are valid Tailscale peers
+    ;(req as any).tailscaleSourceIP = strippedSource
+    ;(req as any).tailscaleClientIP = strippedClient
+    next()
+  } catch (error) {
+    console.error('[Tailscale] Validation error:', error)
+    res.status(404).json({ error: 'Not found' })
+  }
+}
+================================================================================
+FILE: backend\src\lib\validators\auth.ts
+================================================================================
+
+
+// backend/src/lib/validators/auth.ts
+import { z } from 'zod'
+
+// Tunisian phone number validation regex
+const TUNISIAN_PHONE_REGEX = /^(?:(?:\+|00)216)?[2459]\d{7}$/
+
+// Email validation regex (optional, but can keep)
+const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/
+
+export const loginSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+  deviceFingerprint: z.string().optional()
+})
+
+export const registerSchema = z.object({
+  email: z.string().email('Invalid email format').regex(EMAIL_REGEX),
+  password: z.string()
+    .min(8, 'Password must be at least 8 characters')
+    .regex(/[A-Z]/, 'Password must contain at least one uppercase letter')
+    .regex(/[a-z]/, 'Password must contain at least one lowercase letter')
+    .regex(/[0-9]/, 'Password must contain at least one number'),
+  confirmPassword: z.string(),
+}).refine((data) => data.password === data.confirmPassword, {
+  message: "Passwords don't match",
+  path: ["confirmPassword"]
+})
+
+export const verify2FASchema = z.object({
+  sessionId: z.string(),
+  code: z.string().length(6, 'Code must be 6 digits')
+})
+
+export const passwordResetSchema = z.object({
+  email: z.string().email('Invalid email format')
+})
+
+// Profile schema (if needed)
+export const profileSchema = z.object({
+  email: z.string().email('Invalid email address').optional(),
+  phone: z.string().regex(TUNISIAN_PHONE_REGEX, 'Invalid Tunisian phone number').optional(),
+  firstName: z.string().min(2, 'First name must be at least 2 characters').optional(),
+  lastName: z.string().min(2, 'Last name must be at least 2 characters').optional(),
+})
+================================================================================
+FILE: backend\src\lib\security\device-fingerprint.ts
+================================================================================
+
+
+// backend/src/lib/security/device-fingerprint.ts
+// Generates unique device fingerprint from browser characteristics
+// Per documentation: backend/src/lib/security/device-fingerprint.ts
+
+import { createHash } from 'crypto'
+
+export interface DeviceCharacteristics {
+  userAgent: string
+  acceptLanguage: string
+  screenResolution?: string
+  timezone?: string
+  colorDepth?: number
+  pixelRatio?: number
+  touchSupport?: boolean
+  canvas?: string
+  webgl?: string
+  fonts?: string[]
+}
+
+export function generateFingerprint(characteristics: DeviceCharacteristics): string {
+  // Combine characteristics into stable string
+  const components = [
+    characteristics.userAgent,
+    characteristics.acceptLanguage,
+    characteristics.screenResolution || '',
+    characteristics.timezone || '',
+    characteristics.colorDepth?.toString() || '',
+    characteristics.pixelRatio?.toString() || '',
+    characteristics.touchSupport?.toString() || '',
+    characteristics.canvas || '',
+    characteristics.webgl || '',
+    (characteristics.fonts || []).join(',')
+  ]
+  
+  const data = components.join('|')
+  
+  // SHA-256 hash for consistent length
+  return createHash('sha256').update(data).digest('hex')
+}
+
+// Extract characteristics from HTTP request
+export function extractFromRequest(req: any): DeviceCharacteristics {
+  return {
+    userAgent: req.headers['user-agent'] || '',
+    acceptLanguage: req.headers['accept-language'] || '',
+    screenResolution: req.headers['x-screen-resolution'],
+    timezone: req.headers['x-timezone'],
+    colorDepth: req.headers['x-color-depth'] ? parseInt(req.headers['x-color-depth']) : undefined,
+    pixelRatio: req.headers['x-pixel-ratio'] ? parseFloat(req.headers['x-pixel-ratio']) : undefined,
+    touchSupport: req.headers['x-touch-support'] === 'true',
+    canvas: req.headers['x-canvas-fingerprint'],
+    webgl: req.headers['x-webgl-fingerprint'],
+    fonts: req.headers['x-fonts']?.split(',')
+  }
+}
+================================================================================
+FILE: backend\src\lib\redis.ts
+================================================================================
+
+
+// backend/src/lib/redis.ts
+import 'dotenv/config'
+import Redis from 'ioredis'
+
+const redisUrl = process.env.REDIS_URL
+if (!redisUrl) {
+  throw new Error('REDIS_URL environment variable is required')
+}
+
+const redis = new Redis(redisUrl, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+  tls: redisUrl.startsWith('rediss://') ? {} : undefined
+})
+
+redis.on('connect', () => {
+  console.log('✅ Redis connected')
+})
+
+redis.on('error', (err) => {
+  console.error('❌ Redis connection error:', err)
+})
+
+export default redis
+================================================================================
+FILE: backend\src\lib\supabase.ts
+================================================================================
+
+
+import { createClient } from '@supabase/supabase-js'
+import dotenv from 'dotenv'
+
+// Load env variables explicitly
+dotenv.config()
+
+const supabaseUrl = process.env.SUPABASE_URL
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY
+
+if (!supabaseUrl) {
+  console.error('❌ SUPABASE_URL is not set in environment variables')
+  console.error('Current process.env:', Object.keys(process.env))
+  throw new Error('SUPABASE_URL is required. Please check your .env file')
+}
+
+if (!supabaseKey) {
+  console.warn('⚠️  SUPABASE_SERVICE_KEY not set. Database operations will fail.')
+}
+
+console.log('🔧 Supabase URL:', supabaseUrl ? '✓ Loaded' : '✗ Missing')
+console.log('🔧 Supabase Key:', supabaseKey ? '✓ Loaded' : '✗ Missing')
+
+export const supabase = createClient(supabaseUrl, supabaseKey || '', {
+  auth: { 
+    autoRefreshToken: false,
+    persistSession: false,
+  },
+  db: {
+    schema: 'public',
+  },
+})
+
+// Test connection
+export async function testSupabaseConnection(): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.from('User').select('count').limit(1)
+    if (error) throw error
+    console.log('✅ Supabase connected')
+    return true
+  } catch (error) {
+    console.error('❌ Supabase connection failed:', error)
+    return false
+  }
+}
+================================================================================
+FILE: backend\src\lib\audit.ts
+================================================================================
+
+
+// backend/src/lib/audit.ts - FIXED VERSION
+import { supabase } from './supabase.js';
+
+export interface AuditData {
+  userId?: string;
+  action: string;
+  resource: string;
+  resourceId?: string;
+  req: any;
+  success: boolean;
+  errorMessage?: string;
+  metadata?: any;
+}
+
+export async function logAudit(data: AuditData) {
+  try {
+    // Use await with try/catch instead of promise.catch
+    const { error } = await supabase.from('AuditLog').insert({
+      userId: data.userId,
+      action: data.action,
+      resource: data.resource,
+      resourceId: data.resourceId,
+      ipAddress: data.req.ip || data.req.headers['x-forwarded-for'],
+      userAgent: data.req.headers['user-agent'],
+      tailscaleIp: (data.req as any).tailscaleIP,
+      deviceFingerprint: data.req.headers['x-device-fingerprint'],
+      success: data.success,
+      errorMessage: data.errorMessage,
+      metadata: data.metadata ? JSON.stringify(data.metadata) : null,
+      createdAt: new Date().toISOString()
+    });
+    
+    if (error) {
+      console.error('Audit log failed:', error.message);
+    }
+  } catch (err) {
+    // Silent fail - never break main flow
+    console.error('Audit log exception:', err);
+  }
+}
+================================================================================
+FILE: backend\src\lib\encryption.ts
+================================================================================
+
+
+// backend/src/lib/encryption.ts
+// AES-256-GCM encryption for PII data (notes, phone numbers)
+// Per documentation: backend/src/lib/encryption.ts
+
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto'
+
+const ALGORITHM = 'aes-256-gcm'
+const KEY_LENGTH = 32
+const IV_LENGTH = 16
+const AUTH_TAG_LENGTH = 16
+
+// Derive key from environment password
+function getKey(): Buffer {
+  const password = process.env.PII_ENCRYPTION_KEY
+  if (!password || password.length < 32) {
+    throw new Error('PII_ENCRYPTION_KEY must be at least 32 characters')
+  }
+  return scryptSync(password, 'salt', KEY_LENGTH)
+}
+
+export function encrypt(text: string): string {
+  const key = getKey()
+  const iv = randomBytes(IV_LENGTH)
+  const cipher = createCipheriv(ALGORITHM, key, iv)
+  
+  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()])
+  const authTag = cipher.getAuthTag()
+  
+  // Format: iv:authTag:encrypted (all base64)
+  return `${iv.toString('base64')}:${authTag.toString('base64')}:${encrypted.toString('base64')}`
+}
+
+export function decrypt(encryptedData: string): string {
+  const key = getKey()
+  const parts = encryptedData.split(':')
+  
+  if (parts.length !== 3) {
+    throw new Error('Invalid encrypted data format')
+  }
+  
+  const iv = Buffer.from(parts[0], 'base64')
+  const authTag = Buffer.from(parts[1], 'base64')
+  const encrypted = Buffer.from(parts[2], 'base64')
+  
+  const decipher = createDecipheriv(ALGORITHM, key, iv)
+  decipher.setAuthTag(authTag)
+  
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()])
+  return decrypted.toString('utf8')
+}
+
+// For file encryption (exports)
+export function encryptBuffer(buffer: Buffer, password: string): Buffer {
+  const key = scryptSync(password, 'salt', KEY_LENGTH)
+  const iv = randomBytes(IV_LENGTH)
+  const cipher = createCipheriv(ALGORITHM, key, iv)
+  
+  const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()])
+  const authTag = cipher.getAuthTag()
+  
+  // Prepend iv + authTag to encrypted data
+  return Buffer.concat([iv, authTag, encrypted])
+}
+
+export function decryptBuffer(encryptedBuffer: Buffer, password: string): Buffer {
+  const key = scryptSync(password, 'salt', KEY_LENGTH)
+  
+  const iv = encryptedBuffer.subarray(0, IV_LENGTH)
+  const authTag = encryptedBuffer.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH)
+  const encrypted = encryptedBuffer.subarray(IV_LENGTH + AUTH_TAG_LENGTH)
+  
+  const decipher = createDecipheriv(ALGORITHM, key, iv)
+  decipher.setAuthTag(authTag)
+  
+  return Buffer.concat([decipher.update(encrypted), decipher.final()])
+}
+================================================================================
+FILE: backend\src\middleware\error-handler.ts
+================================================================================
+
+
+import { Request, Response, NextFunction } from 'express'
+
+export interface AppError extends Error {
+  statusCode?: number
+  code?: string
+}
+
+export function errorHandler(
+  err: AppError,
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const statusCode = err.statusCode || 500
+  const message = err.message || 'Internal server error'
+  
+  try {
+    if (process.env.NODE_ENV === 'development') {
+      console.error('[Error]', err)
+    } else {
+      console.error(`[Error] ${statusCode}: ${message}`)
+    }
+  } catch (logError) {
+    console.error('[ErrorHandler] Failed to log error:', logError)
+    console.error('[OriginalError]', message)
+  }
+  
+  res.status(statusCode).json({
+    error: message,
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
+  })
+}
+================================================================================
+FILE: frontend\lib\api\client.ts
+================================================================================
+
+
+// frontend/lib/api/client.ts
+import { ApiError, UnauthorizedError, RateLimitError } from './types';
+
+// Environment variables
+const PUBLIC_API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
+const PROXY_API_URL = '/api/admin'; // ✅ use local proxy
+
+const HMAC_SECRET = process.env.NEXT_PUBLIC_HMAC_SECRET || 'dev-secret-change-in-production';
+
+// Token management (preserved)
+let isRefreshing = false
+let failedQueue: Array<{
+  resolve: (value: any) => void
+  reject: (reason?: any) => void
+}> = []
+
+const processQueue = (error: Error | null, token: string | null = null) => {
+  failedQueue.forEach(prom => {
+    if (error) {
+      prom.reject(error)
+    } else {
+      prom.resolve(token)
+    }
+  })
+  failedQueue = []
+}
+
+const getRefreshToken = (): string | null => {
+  if (typeof window === 'undefined') return null;
+  return sessionStorage.getItem('refreshToken');
+};
+
+const setRefreshToken = (token: string) => {
+  if (typeof window !== 'undefined') {
+    sessionStorage.setItem('refreshToken', token);
+  }
+};
+
+const clearRefreshToken = () => {
+  if (typeof window !== 'undefined') {
+    sessionStorage.removeItem('refreshToken');
+  }
+};
+
+// --- Enhanced device fingerprint ---
+async function getDeviceFingerprint(): Promise<string> {
+  if (typeof window === 'undefined') return 'server-side'
+
+  const components: string[] = [
+    navigator.userAgent,
+    navigator.language,
+    screen.colorDepth,
+    screen.width,
+    screen.height,
+    new Date().getTimezoneOffset(),
+    navigator.hardwareConcurrency || 'unknown',
+    navigator.deviceMemory || 'unknown',
+  ]
+
+  // Canvas fingerprint
+  try {
+    const canvas = document.createElement('canvas')
+    canvas.width = 200
+    canvas.height = 50
+    const ctx = canvas.getContext('2d')
+    if (ctx) {
+      ctx.textBaseline = 'top'
+      ctx.font = '14px Arial'
+      ctx.fillStyle = '#f60'
+      ctx.fillRect(0, 0, 100, 50)
+      ctx.fillStyle = '#069'
+      ctx.fillText('Myshow.tn', 2, 15)
+      components.push(canvas.toDataURL())
+    }
+  } catch (e) {}
+
+  // WebGL fingerprint
+  try {
+    const canvas = document.createElement('canvas')
+    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl')
+    if (gl) {
+      const debugInfo = gl.getExtension('WEBGL_debug_renderer_info')
+      if (debugInfo) {
+        components.push(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL))
+        components.push(gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL))
+      }
+    }
+  } catch (e) {}
+
+  // Generate SHA-256 hash
+  const encoder = new TextEncoder()
+  const data = encoder.encode(components.join('|'))
+  const hash = await crypto.subtle.digest('SHA-256', data)
+  return Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 32)
+}
+
+// --- HMAC-SHA256 request signing ---
+async function signRequest(
+  method: string,
+  fullPath: string,
+  timestamp: number,
+  fingerprint: string,
+  body: string
+): Promise<string> {
+  const message = `${method}:${fullPath}:${timestamp}:${fingerprint}:${body}`;
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(HMAC_SECRET);
+  const messageData = encoder.encode(message);
+
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const signatureBuffer = await crypto.subtle.sign('HMAC', cryptoKey, messageData);
+  const signatureHex = Array.from(new Uint8Array(signatureBuffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+  console.log('Frontend signature (hex):', signatureHex); // should be a 64‑char string
+  return signatureHex;
+  console.log('Frontend message:', message);
+  console.log('🔑 Frontend secret (first 4):', HMAC_SECRET.substring(0, 4));
+  
+  console.log('Frontend signature (hex):', signatureBuffer);
+  // Convert ArrayBuffer to hex string
+  return Array.from(new Uint8Array(signatureBuffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+// --- Base request function (preserved token refresh) ---
+async function request<T>(
+  baseUrl: string,
+  prefix: string,
+  endpoint: string,
+  options?: RequestInit,
+  isAdmin: boolean = false,
+  signaturePath?: string,
+  noRedirectOnUnauthorized: boolean = false // ← new parameter
+
+): Promise<T> {
+  const timestamp = Date.now();
+  const fingerprint = await getDeviceFingerprint();
+
+  const method = options?.method || 'GET';
+  const bodyStr = options?.body?.toString() || '';
+  const fullPathForSignature = signaturePath || prefix + endpoint;
+  const signature = await signRequest(method, fullPathForSignature, timestamp, fingerprint, bodyStr);
+
+  const makeRequest = async () => {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Device-Fingerprint': fingerprint,
+      'X-Request-Timestamp': timestamp.toString(),
+      'X-Request-Signature': signature,
+      ...(options?.headers as Record<string, string>)
+    };
+    // No Authorization header – rely on httpOnly cookie
+    const url = `${baseUrl}${prefix}${endpoint}`;
+    return fetch(url, {
+      ...options,
+      headers,
+      credentials: 'include', // critical: sends cookies
+    });
+  };
+
+  let response = await makeRequest();
+
+  // Handle token refresh for admin API only
+  if (isAdmin && response.status === 401 && !isRefreshing) {
+    const refreshToken = getRefreshToken();
+    if (refreshToken) {
+      isRefreshing = true;
+      try {
+        const refreshResponse = await fetch(`${baseUrl}${prefix}/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken })
+        });
+        if (refreshResponse.ok) {
+          const { refreshToken: newRefreshToken } = await refreshResponse.json();
+          setRefreshToken(newRefreshToken); // store new refresh token
+          processQueue(null, null);
+          response = await makeRequest(); // retry original request
+        } else {
+          clearRefreshToken();
+    processQueue(new Error('Refresh failed'), null);
+    if (!noRedirectOnUnauthorized) {
+        if (typeof window !== 'undefined') {
+            window.location.href = '/login?reason=session_expired';
+        }
+    }
+          throw new UnauthorizedError('Session expired');
+        }
+      } catch (error) {
+        processQueue(error as Error, null);
+        throw error;
+      } finally {
+        isRefreshing = false;
+      }
+    } else {
+        // No refresh token – do NOT throw here; let normal error handling process the response
+        // Just set a flag to prevent refresh loop, but continue to error handling
+        // (no action needed, we'll fall through)
+      }
+  } else if (isAdmin && response.status === 401 && isRefreshing) {
+    // Wait for refresh to complete
+    await new Promise((resolve, reject) => {
+      failedQueue.push({ resolve, reject });
+    });
+    response = await makeRequest();
+  }
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    switch (response.status) {
+      case 401:
+      if (isAdmin && !noRedirectOnUnauthorized) { // ← check flag
+               clearRefreshToken();
+               if (typeof window !== 'undefined') {
+                 window.location.href = '/login?reason=unauthorized';
+               }
+             }
+        throw new UnauthorizedError(data.error || 'Authentication required');
+      case 429:
+        throw new RateLimitError(data.error || 'Rate limit exceeded');
+      default:
+        throw new ApiError(
+          data.error || 'Request failed',
+          data.code,
+          response.status
+        );
+    }
+  }
+
+  return data as T;
+}
+
+
+// Public API (direct)
+export async function publicAPI<T>(
+  endpoint: string,
+  options?: RequestInit
+): Promise<T> {
+  return request<T>(PUBLIC_API_URL, '/public', endpoint, options, false);
+}
+
+// Admin API (via proxy)
+export async function adminAPI<T>(
+  endpoint: string,
+  options?: RequestInit & { noRedirectOnUnauthorized?: boolean } // ← extended
+): Promise<T> {
+  const signaturePath = '/api/admin' + endpoint;
+  const { noRedirectOnUnauthorized, ...fetchOptions } = options || {};
+  return request<T>(PROXY_API_URL, '', endpoint, fetchOptions, true, signaturePath, noRedirectOnUnauthorized);
+}
+
+export async function getSessionStatus() {
+  const response = await fetch(`${PROXY_API_URL}/auth/status`, {
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  const data = await response.json();
+  return data.user; // returns user object or null
+}
+export async function login(email: string, password: string) {
+  const data = await adminAPI<any>('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+    noRedirectOnUnauthorized: true   
+  });
+
+  if (data.requires2FA) {
+    return { requires2FA: true, sessionId: data.sessionId };
+  }
+
+  if (data.refreshToken) {
+    setRefreshToken(data.refreshToken);
+  }
+  return data;
+}
+
+// Verify 2FA
+export async function verify2FA(sessionId: string, code: string) {
+  const data = await adminAPI<any>('/auth/verify-2fa', {
+    method: 'POST',
+    body: JSON.stringify({ sessionId, code }),
+    noRedirectOnUnauthorized: true
+  });
+
+  // After 2FA, backend sets httpOnly cookie and returns new refreshToken
+  if (data.refreshToken) {
+    setRefreshToken(data.refreshToken);
+  }
+  return data;
+}
+
+export async function resendResetCode(email: string) {
+  const data = await adminAPI<any>('/auth/resend-reset-code', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+    noRedirectOnUnauthorized: true,
+  });
+  return data;
+}
+
+export async function resend2FA(sessionId: string) {
+  const data = await adminAPI<any>('/auth/resend-2fa', {
+    method: 'POST',
+    body: JSON.stringify({ sessionId }),
+    noRedirectOnUnauthorized: true, // 401 would be unexpected, but handle gracefully
+  });
+  return data;
+}
+// Logout
+export async function logout() {
+  try {
+    await adminAPI('/auth/logout', { method: 'POST' });
+  } finally {
+    clearRefreshToken();
+    window.location.href = '/login';
+  }
+}
+================================================================================
+FILE: frontend\lib\api\hooks.ts
+================================================================================
+
+
+// frontend/lib/api/hooks.ts
+import { useState, useEffect, useCallback } from 'react'
+import { publicAPI, adminAPI } from './client'
+import { withErrorHandling } from './error-handler'
+import { ApiError } from './types'
+
+// Generic fetch hook
+export function useAPI<T>(
+  fetcher: () => Promise<T>,
+  deps: any[] = []
+) {
+  const [data, setData] = useState<T | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<ApiError | null>(null)
+
+  useEffect(() => {
+    let mounted = true
+
+    const fetchData = async () => {
+      try {
+        setLoading(true)
+        const result = await withErrorHandling(fetcher(), { showToast: false })
+        if (mounted) {
+          setData(result)
+          setError(null)
+        }
+      } catch (err) {
+        if (mounted) {
+          setError(err as ApiError)
+        }
+      } finally {
+        if (mounted) {
+          setLoading(false)
+        }
+      }
+    }
+
+    fetchData()
+
+    return () => {
+      mounted = false
+    }
+  }, deps)
+
+  return { data, loading, error }
+}
+
+// Hook for public GET requests
+export function usePublicGET<T>(
+  endpoint: string,
+  deps: any[] = []
+) {
+  return useAPI(() => publicAPI<T>(endpoint), [endpoint, ...deps])
+}
+
+// Hook for admin GET requests
+export function useAdminGET<T>(
+  endpoint: string,
+  deps: any[] = []
+) {
+  return useAPI(() => adminAPI<T>(endpoint), [endpoint, ...deps])
+}
+
+// Mutation hooks (POST, PUT, DELETE)
+export function useMutation<T, D = any>(
+  apiFunction: (data: D) => Promise<T>
+) {
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<ApiError | null>(null)
+
+  const mutate = useCallback(
+    async (data: D): Promise<T | null> => {
+      setLoading(true)
+      setError(null)
+
+      try {
+        const result = await withErrorHandling(apiFunction(data))
+        return result
+      } catch (err) {
+        setError(err as ApiError)
+        return null
+      } finally {
+        setLoading(false)
+      }
+    },
+    [apiFunction]
+  )
+
+  return { mutate, loading, error }
+}
+
+// Specific mutation creators
+export function usePublicPOST<T, D = any>(endpoint: string) {
+  return useMutation<T, D>((data) =>
+    publicAPI<T>(endpoint, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+  )
+}
+
+export function usePublicPUT<T, D = any>(endpoint: string) {
+  return useMutation<T, D>((data) =>
+    publicAPI<T>(endpoint, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    })
+  )
+}
+
+export function usePublicDELETE<T>(endpoint: string) {
+  return useMutation<T, void>(() =>
+    publicAPI<T>(endpoint, {
+      method: 'DELETE',
+    })
+  )
+}
+
+// Admin mutations (same pattern)
+export function useAdminPOST<T, D = any>(endpoint: string) {
+  return useMutation<T, D>((data) =>
+    adminAPI<T>(endpoint, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+  )
+}
+
+export function useAdminPUT<T, D = any>(endpoint: string) {
+  return useMutation<T, D>((data) =>
+    adminAPI<T>(endpoint, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    })
+  )
+}
+
+export function useAdminDELETE<T, D = any>(endpoint: string) {
+  return useMutation<T, D>((data) =>
+    adminAPI<T>(endpoint, {
+      method: 'DELETE',
+      body: JSON.stringify(data), // ✅ now sends body
+    })
+  )
+}
+================================================================================
+FILE: frontend\lib\api\error-handler.ts
+================================================================================
+
+
+// frontend/lib/api/error-handler.ts
+import { ApiError, UnauthorizedError, RateLimitError } from './types';
+
+export interface ErrorHandlerOptions {
+  showToast?: boolean
+  redirectOnUnauthorized?: boolean
+  onError?: (error: ApiError) => void
+}
+
+export async function handleAPIError(
+  error: unknown,
+  options: ErrorHandlerOptions = {}
+): Promise<never> {
+  const { showToast = true, redirectOnUnauthorized = true, onError } = options
+
+  let message = 'An unexpected error occurred'
+  let code = 'UNKNOWN_ERROR'
+
+  if (error instanceof ApiError) {
+    message = error.message
+    code = error.code || 'API_ERROR'
+
+    // Handle specific errors
+    if (error instanceof UnauthorizedError && redirectOnUnauthorized) {
+      // Redirect to login
+      if (typeof window !== 'undefined') {
+        window.location.href = '/fr/auth/login'
+      }
+    }
+
+    if (error instanceof RateLimitError) {
+      message = 'Too many requests. Please try again later.'
+    }
+  } else if (error instanceof Error) {
+    message = error.message
+  }
+
+  // Log error (in production, send to Sentry)
+  console.error(`[API Error] ${code}:`, message, error)
+
+  // Show toast notification if enabled
+  if (showToast && typeof window !== 'undefined') {
+    // We'll implement toast in Phase 8 with shadcn/ui
+    alert(message) // Temporary
+  }
+
+  // Call custom error handler
+  if (onError && error instanceof ApiError) {
+    onError(error)
+  }
+
+  throw error
+}
+
+// Usage wrapper
+export async function withErrorHandling<T>(
+  promise: Promise<T>,
+  options?: ErrorHandlerOptions
+): Promise<T> {
+  try {
+    return await promise
+  } catch (error) {
+    await handleAPIError(error, options)
+    throw error // TypeScript needs this, but handleAPIError always throws
+  }
+}
+================================================================================
+FILE: frontend\lib\api\types.ts
+================================================================================
+
+
+// frontend/lib/api/types.ts
+
+export interface User {
+  id: string
+  email: string
+  role: 'USER' | 'ADMIN'
+  createdAt: string
+}
+
+export interface Booking {
+  id: string
+  eventId: string
+  date: string
+  childrenCount: number
+  status: 'PENDING' | 'CONFIRMED' | 'CANCELLED'
+  totalPrice: number
+  paymentStatus: 'PENDING' | 'PAID' | 'FAILED' | 'REFUNDED'
+  notes?: string
+  createdAt: string
+}
+
+export interface AdminBooking extends Booking {
+  user: Pick<User, 'email'>
+  event: Pick<Event, 'titleFr' | 'titleAr'>
+}
+
+export interface Event {
+  id: string
+  titleFr: string
+  titleAr: string
+  descriptionFr: string
+  descriptionAr: string
+  date: string
+  capacity: number
+  availableSlots: number
+  price: number
+  location: string
+}
+
+export interface Product {
+  id: string
+  nameFr: string
+  nameAr: string
+  descriptionFr: string
+  descriptionAr: string
+  price: number
+  stock: number
+  category: string
+  imageUrl?: string
+}
+
+export interface Message {
+  id: string
+  name: string
+  email: string
+  phone?: string
+  message: string
+  status: 'NEW' | 'READ' | 'REPLIED'
+  adminNotes?: string
+  createdAt: string
+}
+
+export interface Settings {
+  deleteVerificationCode: string
+  sessionTimeoutMinutes: number
+  notificationEmail?: string
+  telegramChatId?: string
+  language: 'fr' | 'ar'
+}
+
+// Error classes
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public code?: string,
+    public status?: number
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+export class RateLimitError extends ApiError {
+  constructor(message: string = 'Too many requests') {
+    super(message, 'RATE_LIMIT', 429);
+  }
+}
+
+export class UnauthorizedError extends ApiError {
+  constructor(message: string = 'Unauthorized') {
+    super(message, 'UNAUTHORIZED', 401);
+  }
+}
+================================================================================
+FILE: frontend\components\providers\SessionProvider.tsx
+================================================================================
+
+
+'use client'
+
+import { useEffect, createContext, useContext, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { adminAPI } from '@/lib/api/client'
+
+interface User {
+  id: string
+  email: string
+  role: 'ADMIN'
+}
+
+interface SessionContextType {
+  user: User | null
+  loading: boolean
+}
+
+const SessionContext = createContext<SessionContextType>({ user: null, loading: true })
+
+export function SessionProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null)
+  const [loading, setLoading] = useState(true)
+  const router = useRouter()
+
+  useEffect(() => {
+    adminAPI<{ user: User }>('/auth/me')
+      .then((data) => {
+        setUser(data.user)
+      })
+      .catch(() => {
+        router.push('/login?reason=unauthorized')
+      })
+      .finally(() => setLoading(false))
+  }, [router])
+
+  return (
+    <SessionContext.Provider value={{ user, loading }}>
+      {children}
+    </SessionContext.Provider>
+  )
+}
+
+export const useSession = () => useContext(SessionContext)
+================================================================================
+FILE: frontend\navigation.ts
+================================================================================
+
+
+import { createNavigation } from 'next-intl/navigation';
+
+// Define your supported locales and default locale (must match those in i18n/request.ts)
+export const locales = ['fr', 'ar'] as const;
+export const defaultLocale = 'fr';
+
+export const { Link, redirect, usePathname, useRouter } = createNavigation({
+  locales,
+  defaultLocale
+});
+================================================================================
+FILE: frontend\proxy.ts
+================================================================================
+
+
+// frontend/proxy.ts
+import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
+import createMiddleware from 'next-intl/middleware'
+
+const locales = ['fr', 'ar']
+const defaultLocale = 'fr'
+
+const intlMiddleware = createMiddleware({
+  locales,
+  defaultLocale,
+  localeDetection: true,
+  localePrefix: 'always'
+})
+
+const ADMIN_API_URL = process.env.NEXT_PUBLIC_ADMIN_API_URL || 'http://localhost:4001'
+
+export async function proxy(request: NextRequest) {
+  const pathname = request.nextUrl.pathname
+
+  // Skip static files and API routes
+  if (pathname.includes('/api') || pathname.match(/\.(ico|png|jpg|jpeg|svg|css|js)$/)) {
+    return NextResponse.next()
+  }
+
+  // ============================================
+  // 1. Redirect authenticated users away from auth pages
+  // ============================================
+  const isAuthPage = 
+    pathname.includes('/login') ||
+    pathname.includes('/forgot-password') ||
+    pathname.includes('/reset-password') ||
+    pathname.includes('/verify-2fa')
+
+  if (isAuthPage) {
+    const token = request.cookies.get('token')
+    if (token) {
+      const locale = pathname.split('/')[1] || defaultLocale
+      return NextResponse.redirect(new URL(`/${locale}/admin`, request.url))
+    }
+  }
+
+  // ============================================
+  // 2. Admin route protection (Tailscale + session)
+  // ============================================
+  if (pathname === '/admin' || pathname.startsWith('/admin/')) {
+    try {
+      const clientIP = request.headers.get('x-forwarded-for') ||
+                       request.headers.get('x-real-ip') ||
+                       'unknown'
+
+      // Tailscale peer validation
+      const tailscaleRes = await fetch(`${ADMIN_API_URL}/api/admin/health`, {
+        headers: { 'X-Forwarded-For': clientIP },
+        signal: AbortSignal.timeout(10000),
+      })
+
+      if (!tailscaleRes.ok) {
+        // Non‑Tailscale – 404
+        const locale = pathname.split('/')[1] || defaultLocale
+        return NextResponse.redirect(new URL(`/${locale}/404`, request.url))
+      }
+
+      // Session check – prevent flash of admin page
+      const token = request.cookies.get('token')
+      if (!token) {
+        const locale = pathname.split('/')[1] || defaultLocale
+        return NextResponse.redirect(new URL(`/${locale}/login`, request.url))
+      }
+
+      // All good, serve the page
+      return NextResponse.next()
+    } catch (error) {
+      console.error('[Proxy] Tailscale check error:', error)
+      const locale = pathname.split('/')[1] || defaultLocale
+      return NextResponse.redirect(new URL(`/${locale}/404`, request.url))
+    }
+  }
+
+  // ============================================
+  // 3. All other routes – let next-intl handle
+  // ============================================
+  return intlMiddleware(request)
+}
+
+export const config = {
+  matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)']
+}

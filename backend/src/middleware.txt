@@ -1,0 +1,577 @@
+
+================================================================================
+FILE: admin-auth.ts
+================================================================================
+
+================================================================================
+FILE: auth.ts
+================================================================================
+// backend/src/middleware/auth.ts
+// JWT validation and session integrity
+// Per documentation: backend/src/middleware/auth.ts
+
+import { Request, Response, NextFunction } from 'express'
+import { verifyToken, validateSession } from '../services/auth-service.js'
+
+export interface AuthenticatedRequest extends Request {
+  user?: {
+    id: string
+    email: string
+    role: 'USER' | 'ADMIN'
+    sessionId: string
+  }
+}
+
+// Validate JWT and session
+export async function authenticateToken(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '')
+    
+    if (!token) {
+      res.status(401).json({ error: 'Access denied' })
+      return
+    }
+    
+    // Verify JWT
+    const decoded = verifyToken(token) as any
+    
+    // Validate session integrity
+    const valid = await validateSession(decoded.sessionId, req)
+    if (!valid) {
+      res.status(401).json({ error: 'Session invalid' })
+      return
+    }
+    
+    // Attach user to request
+    req.user = {
+      id: decoded.userId,
+      email: decoded.email,
+      role: decoded.role,
+      sessionId: decoded.sessionId
+    }
+    
+    next()
+    
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token' })
+  }
+}
+
+// Require admin role
+export function requireAdmin(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): void {
+  if (req.user?.role !== 'ADMIN') {
+    res.status(403).json({ error: 'Admin access required' })
+    return
+  }
+  next()
+}
+================================================================================
+FILE: error-handler.ts
+================================================================================
+// backend/src/middleware/error-handler.ts
+import { Request, Response, NextFunction } from 'express'
+
+export interface AppError extends Error {
+  statusCode?: number
+  code?: string
+}
+
+export function errorHandler(
+  err: AppError,
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const statusCode = err.statusCode || 500
+  const message = err.message || 'Internal server error'
+  
+  if (process.env.NODE_ENV === 'development') {
+    console.error('[Error]', err)
+  } else {
+    console.error(`[Error] ${statusCode}: ${message}`)
+  }
+  
+  res.status(statusCode).json({
+    error: message,
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
+  })
+}// backend/src/middleware/geo.ts
+// Geo‑location middleware using geoip-lite (offline database)
+import { Request, Response, NextFunction } from 'express'
+import geoip from 'geoip-lite'
+
+export interface GeoLocation {
+  city: string
+  country: string
+  lat: number
+  lon: number
+  region?: string
+  timezone?: string
+}
+
+export async function attachGeoLocation(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    // Extract IP address (handle proxies)
+    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() 
+                || req.socket.remoteAddress 
+                || req.ip 
+                || ''
+
+    // Skip for localhost or private IPs (optional)
+    if (!ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168.') || ip.startsWith('10.')) {
+      ;(req as any).geoLocation = null
+      return next()
+    }
+
+    // Look up geo data
+    const geo = geoip.lookup(ip)
+
+    if (geo) {
+      ;(req as any).geoLocation = {
+        city: geo.city,
+        country: geo.country,
+        lat: geo.ll[0],
+        lon: geo.ll[1],
+        region: geo.region,
+        timezone: geo.timezone,
+      }
+    } else {
+      ;(req as any).geoLocation = null
+    }
+
+    next()
+  } catch (error) {
+    // Fail silently – do not block the request
+    console.error('Geo-lookup error:', error)
+    ;(req as any).geoLocation = null
+    next()
+  }
+}
+================================================================================
+FILE: session-check.ts
+================================================================================
+/**
+ * Session Check Middleware
+ * 
+ * Implements Layer 7: Session Integrity per conv.txt security requirements
+ * 
+ * Security Features:
+ * - Session token extraction
+ * - Device fingerprint validation
+ * - IP address consistency check
+ * - Session expiration check
+ * - Concurrent session handling
+ */
+
+import { Request, Response, NextFunction } from 'express'
+import { AuditLogger, AuditEventType } from '../lib/security/audit-logger'
+
+// Extend Express Request type
+declare global {
+  namespace Express {
+    interface Request {
+      sessionId?: string
+      sessionValid?: boolean
+    }
+  }
+}
+
+/**
+ * Session Configuration
+ */
+const SESSION_CONFIG = {
+  MAX_CONCURRENT_SESSIONS: 3,
+  SESSION_TIMEOUT: 24 * 60 * 60 * 1000, // 24 hours
+  ABSOLUTE_TIMEOUT: 7 * 24 * 60 * 60 * 1000, // 7 days
+} as const
+
+/**
+ * In-memory session store (use Redis in production)
+ */
+interface SessionData {
+  userId: string
+  email: string
+  role: string
+  deviceFingerprint: string
+  ipAddress: string
+  createdAt: Date
+  lastActivity: Date
+  expiresAt: Date
+}
+
+const sessionStore: Map<string, SessionData> = new Map()
+
+/**
+ * Session Check Middleware Class
+ * Per conv.txt: "Session integrity validation with device fingerprinting"
+ */
+export class SessionCheckMiddleware {
+  /**
+   * Extract session token from request
+   */
+  private static extractSessionToken(req: Request): string | null {
+    return req.cookies?.['session-token'] ||
+           req.headers.authorization?.replace('Bearer ', '') ||
+           req.headers['x-session-token'] as string ||
+           null
+  }
+
+  /**
+   * Validate session exists and is valid
+   */
+  private static validateSession(token: string): SessionData | null {
+    const session = sessionStore.get(token)
+    if (!session) {
+      return null
+    }
+
+    const now = Date.now()
+    
+    // Check if session has expired
+    if (session.expiresAt.getTime() < now) {
+      sessionStore.delete(token)
+      return null
+    }
+
+    // Check absolute timeout
+    if (session.createdAt.getTime() + SESSION_CONFIG.ABSOLUTE_TIMEOUT < now) {
+      sessionStore.delete(token)
+      return null
+    }
+
+    return session
+  }
+
+  /**
+   * Check for concurrent sessions
+   */
+  private static countUserSessions(userId: string): number {
+    let count = 0
+    for (const session of sessionStore.values()) {
+      if (session.userId === userId) {
+        count++
+      }
+    }
+    return count
+  }
+
+  /**
+   * Main middleware function
+   * Per conv.txt: "Session validation with device fingerprinting"
+   */
+  static check = (req: Request, res: Response, next: NextFunction): void => {
+    try {
+      // Extract session token
+      const token = this.extractSessionToken(req)
+
+      if (!token) {
+        // No session token - continue without session
+        next()
+        return
+      }
+
+      // Validate session
+      const session = this.validateSession(token)
+
+      if (!session) {
+        // Invalid or expired session
+        AuditLogger.log(
+          AuditEventType.SESSION_EXPIRED,
+          'SESSION_CHECK',
+          'Invalid or expired session',
+          false,
+          req
+        )
+
+        res.status(401).json({
+          success: false,
+          error: 'Session expired',
+          message: 'Your session has expired. Please log in again.',
+        })
+        return
+      }
+
+      // Validate device fingerprint
+      const requestFingerprint = req.headers['x-device-fingerprint'] as string
+      if (requestFingerprint && requestFingerprint !== session.deviceFingerprint) {
+        AuditLogger.log(
+          AuditEventType.SUSPICIOUS_ACTIVITY,
+          'SESSION_CHECK',
+          'Device fingerprint mismatch during session',
+          false,
+          req,
+          {
+            userId: session.userId,
+            errorMessage: `Expected: ${session.deviceFingerprint}, Got: ${requestFingerprint}`,
+          }
+        )
+
+        // Log but allow (might be legitimate device change)
+        console.log(`⚠️ Device fingerprint changed for user ${session.userId}`)
+      }
+
+      // Validate IP address (allow minor changes)
+      const requestIP = req.ip || ''
+      if (requestIP && requestIP !== session.ipAddress) {
+        // Log but allow (IP might change due to mobile networks)
+        AuditLogger.log(
+          AuditEventType.SUSPICIOUS_ACTIVITY,
+          'SESSION_CHECK',
+          'IP address changed during session',
+          true,
+          req,
+          {
+            userId: session.userId,
+            metadata: {
+              originalIP: session.ipAddress,
+              newIP: requestIP,
+            },
+          }
+        )
+      }
+
+      // Check concurrent sessions
+      const userSessionCount = this.countUserSessions(session.userId)
+      if (userSessionCount > SESSION_CONFIG.MAX_CONCURRENT_SESSIONS) {
+        AuditLogger.log(
+          AuditEventType.SUSPICIOUS_ACTIVITY,
+          'SESSION_CHECK',
+          `Too many concurrent sessions (${userSessionCount})`,
+          false,
+          req,
+          { userId: session.userId }
+        )
+
+        // Remove oldest session
+        let oldestToken: string | null = null
+        let oldestTime = Date.now()
+        
+        for (const [token, sess] of sessionStore.entries()) {
+          if (sess.userId === session.userId && sess.createdAt.getTime() < oldestTime) {
+            oldestTime = sess.createdAt.getTime()
+            oldestToken = token
+          }
+        }
+        
+        if (oldestToken) {
+          sessionStore.delete(oldestToken)
+        }
+      }
+
+      // Update last activity
+      session.lastActivity = new Date()
+
+      // Add session to request
+      req.sessionId = token
+      req.sessionValid = true
+
+      console.log(`✅ Session validated for user ${session.userId}`)
+      next()
+    } catch (error) {
+      console.error('❌ Session check error:', error)
+
+      AuditLogger.log(
+        AuditEventType.SYSTEM_ERROR,
+        'SESSION_CHECK',
+        'Session validation error',
+        true,
+        req,
+        { errorMessage: error instanceof Error ? error.message : 'Unknown error' }
+      )
+
+      // Fail open - allow request without session
+      next()
+    }
+  }
+
+  /**
+   * Create new session
+   */
+  static createSession(
+    token: string,
+    userId: string,
+    email: string,
+    role: string,
+    deviceFingerprint: string,
+    ipAddress: string
+  ): void {
+    const now = new Date()
+    
+    sessionStore.set(token, {
+      userId,
+      email,
+      role,
+      deviceFingerprint,
+      ipAddress,
+      createdAt: now,
+      lastActivity: now,
+      expiresAt: new Date(now.getTime() + SESSION_CONFIG.SESSION_TIMEOUT),
+    })
+
+    AuditLogger.log(
+      AuditEventType.SESSION_CREATED,
+      'SESSION_MANAGEMENT',
+      `Session created for user ${email}`,
+      true,
+      undefined,
+      { userId, metadata: { deviceFingerprint } }
+    )
+  }
+
+  /**
+   * Terminate session
+   */
+  static terminateSession(token: string): void {
+    const session = sessionStore.get(token)
+    if (session) {
+      sessionStore.delete(token)
+
+      AuditLogger.log(
+        AuditEventType.SESSION_REVOKED,
+        'SESSION_MANAGEMENT',
+        `Session terminated for user ${session.email}`,
+        true,
+        undefined,
+        { userId: session.userId }
+      )
+    }
+  }
+
+  /**
+   * Terminate all user sessions
+   */
+  static terminateAllUserSessions(userId: string): number {
+    let count = 0
+    for (const [token, session] of sessionStore.entries()) {
+      if (session.userId === userId) {
+        sessionStore.delete(token)
+        count++
+      }
+    }
+
+    AuditLogger.log(
+      AuditEventType.SESSION_REVOKED,
+      'SESSION_MANAGEMENT',
+      `All sessions terminated for user ${userId}`,
+      true,
+      undefined,
+      { metadata: { sessionCount: count } }
+    )
+
+    return count
+  }
+
+  /**
+   * Get active session count
+   */
+  static getActiveSessionCount(): number {
+    return sessionStore.size
+  }
+
+  /**
+   * Clear all sessions (for testing)
+   */
+  static clearAllSessions(): void {
+    sessionStore.clear()
+  }
+}
+
+export default SessionCheckMiddleware
+================================================================================
+FILE: validate-request.ts
+================================================================================
+// backend/src/middleware/validate-request.ts
+// HMAC-SHA256 request signature verification (bank‑level security)
+// Per documentation: backend/src/middleware/validate-request.ts
+
+import { Request, Response, NextFunction } from 'express'
+import { createHmac, timingSafeEqual } from 'crypto'
+
+const SIGNATURE_SECRET = process.env.REQUEST_SIGNATURE_SECRET || process.env.JWT_SECRET
+if (!SIGNATURE_SECRET) {
+  throw new Error('REQUEST_SIGNATURE_SECRET or JWT_SECRET must be set')
+}
+
+export async function validateRequestSignature(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  if (req.path === '/health' ||
+      req.path.startsWith('/api/public/auth/') || req.path === '/api/admin/health'  || req.path === '/api/admin/auth/status' ) {
+    return next();
+  }
+  try {
+    // 1. Extract required headers
+    const signature = req.headers['x-request-signature'] as string
+    const timestamp = req.headers['x-request-timestamp'] as string
+    const fingerprint = req.headers['x-device-fingerprint'] as string
+
+    if (!signature || !timestamp) {
+      res.status(401).json({ error: 'Missing signature headers' })
+      return
+    }
+
+    // 2. Prevent replay attacks (5 min window)
+    const now = Date.now()
+    const requestTime = parseInt(timestamp, 10)
+
+    const maxAge = process.env.NODE_ENV === 'production' ? 5 * 60 * 1000 : 10 * 60 * 1000; // 10 min in dev
+
+    if (isNaN(requestTime) || Math.abs(now - requestTime) > maxAge) {
+      res.status(401).json({ error: 'Request expired or invalid timestamp' })
+      return
+    }
+
+    // 3. Build the string that was signed (must match frontend)
+    const method = req.method
+    const path = req.originalUrl || req.url
+    const body = JSON.stringify(req.body) || ''
+    const dataToSign = `${method}:${path}:${timestamp}:${fingerprint || ''}:${body}`
+
+    // 4. Compute expected signature
+    const expectedSignature = createHmac('sha256', SIGNATURE_SECRET)
+      .update(dataToSign)
+      .digest('hex')
+    console.log('--- Signature Debug ---');
+    console.log('Method:', method);
+    console.log('Path:', path);
+    console.log('Timestamp:', timestamp);
+    console.log('Fingerprint:', fingerprint);
+    console.log('🔑 Backend secret (first 4):', SIGNATURE_SECRET.substring(0, 4));
+    console.log('Body:', body);
+    console.log('Data to sign:', dataToSign);
+    console.log('Expected signature:', expectedSignature);
+    console.log('Received signature:', signature);
+    // 5. Timing‑safe comparison
+    const sigBuffer = Buffer.from(signature, 'hex')
+    const expBuffer = Buffer.from(expectedSignature, 'hex')
+
+    if (sigBuffer.length !== expBuffer.length ||
+        !timingSafeEqual(sigBuffer, expBuffer)) {
+      res.status(401).json({ error: 'Invalid signature' })
+      return
+    }
+
+    // 6. Attach validated fingerprint for later use (optional)
+    ;(req as any).validatedFingerprint = fingerprint
+
+    next()
+  } catch (error) {
+    // Log error but don't expose details to client
+    console.error('Signature validation error:', error)
+    res.status(500).json({ error: 'Signature validation failed' })
+  }
+}

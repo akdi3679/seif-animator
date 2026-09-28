@@ -1,0 +1,4489 @@
+
+
+========================================
+
+FILE: backend\src\server.ts
+
+========================================
+
+// backend/src/server.ts
+// Enterprise: Silent connections, state-change-only logging, exponential backoff
+// + Security hardening: request smuggling protection, cache poisoning prevention, robust admin creation
+
+import express from 'express'
+import cors from 'cors'
+import helmet from 'helmet'
+import cookieParser from 'cookie-parser'
+import dotenv from 'dotenv'        
+import { exec } from 'child_process'
+import { promisify } from 'util'
+
+import pRetry from 'p-retry';
+import cron from 'node-cron';
+import { syncCalEventTypes } from './services/cal-sync.service.js';
+import { systemLoadMiddleware } from './middleware/system-load.js';
+import { v2 as cloudinary } from 'cloudinary';
+import { deleteCloudinaryImage } from './lib/cloudinary.js';
+
+
+
+
+
+dotenv.config()
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+const execAsync = promisify(exec)
+
+import { publicRoutes } from './routes/public/index.js'
+import { adminRoutes } from './routes/admin/index.js'
+import { validateTailscalePeer } from './middleware/tailscale.js'
+import { errorHandler } from './middleware/error-handler.js'
+import { closeQueues } from './lib/queue.js'
+import redis from './lib/redis.js'
+import { supabase, testSupabaseConnection } from './lib/supabase.js'
+import { createDefaultAdmin } from './services/auth-service.js'
+import { handleCalcomWebhook } from './routes/public/calcom-webhook.js';
+
+
+const PORT_PUBLIC = parseInt(process.env.PORT_PUBLIC || '4000')
+const PORT_ADMIN = parseInt(process.env.PORT_ADMIN || '4001')
+const NODE_ENV = process.env.NODE_ENV || 'development'
+const PUBLIC_CORS_ORIGIN = process.env.PUBLIC_CORS_ORIGIN?.split(',') || ['http://localhost:3000']
+const ADMIN_CORS_ORIGIN = process.env.ADMIN_CORS_ORIGIN?.split(',') || ['http://localhost:3000']
+
+//const retryTimers: Record<string, NodeJS.Timeout | null> = {}
+
+// ============================================
+// SILENT CONNECTION MANAGER (Enterprise Pattern)
+// ============================================
+
+interface ConnectionState {
+  connected: boolean
+  announced: boolean
+  failCount: number
+}
+
+const connections: Record<string, ConnectionState> = {
+  redis: { connected: false, announced: false, failCount: 0 },
+  supabase: { connected: false, announced: false, failCount: 0 }
+}
+
+const RETRY_BASE_MS = 5000
+const RETRY_MAX_MS = 60000
+
+function getRetryDelay(failCount: number): number {
+  return Math.min(RETRY_BASE_MS * Math.pow(2, failCount), RETRY_MAX_MS)
+}
+
+// Flag to ensure admin creation runs only once after supabase connects
+let adminCreated = false
+
+
+
+// Circuit breaker options
+// ============================================
+// SIMPLIFIED CONNECTION MANAGER (no opossum)
+// ============================================
+
+async function checkRedis(): Promise<boolean> {
+  await redis.ping();
+  return true;
+}
+
+async function checkSupabase(): Promise<boolean> {
+  const ok = await testSupabaseConnection();
+  if (!ok) throw new Error('Supabase unhealthy');
+  return true;
+}
+
+async function manageConnection(
+  name: string,
+  checkFn: () => Promise<boolean>,
+  onConnect?: () => Promise<void>
+) {
+  const state = connections[name];
+
+  // Try the health check directly (with pRetry for backoff)
+  try {
+    await pRetry(async () => {
+      await checkFn();
+    }, {
+      retries: 3,
+      factor: 2,
+      minTimeout: 1000,
+      maxTimeout: 10000,
+      onFailedAttempt: (err) => {
+        console.log(`⚠️  ${name} health check attempt ${err.attemptNumber} failed`);
+      },
+    });
+
+    // Success
+    if (!state.connected) {
+      state.connected = true;
+      state.failCount = 0;
+      console.log(`✅ ${name} connected`);
+      if (onConnect) await onConnect();
+    }
+    state.connected = true;
+    state.failCount = 0;
+  } catch {
+    // All retries failed
+    if (state.connected) {
+      console.log(`⚠️  ${name} disconnected`);
+      state.connected = false;
+    }
+    state.failCount++;
+    const delay = getRetryDelay(state.failCount);
+    console.log(`⚠️  ${name} will retry in ${delay / 1000}s`);
+    setTimeout(() => manageConnection(name, checkFn, onConnect), delay);
+  }
+}
+
+function startConnectionManagers() {
+  // Redis
+  manageConnection('redis', checkRedis);
+  setInterval(() => manageConnection('redis', checkRedis), 30_000);
+
+  // Supabase (with admin creation on first connect)
+  let supabaseFirstConnect = false;
+  manageConnection('supabase', checkSupabase, async () => {
+    if (!adminCreated) {
+      await createDefaultAdmin();
+      adminCreated = true;
+      console.log('✅ Admin creation check completed');
+    }
+  });
+  setInterval(() => manageConnection('supabase', checkSupabase), 30_000);
+}
+
+// ============================================
+// TAILSCALE
+// ============================================
+
+async function getTailscaleIP(): Promise<string> {
+  if (process.env.TAILSCALE_SERVER_IP) {
+    return process.env.TAILSCALE_SERVER_IP
+  }
+  try {
+    const { stdout } = await execAsync('tailscale ip -4')
+    return stdout.trim()
+  } catch {
+    if (process.env.NODE_ENV === 'production') {
+      console.error('❌ Failed to get Tailscale IP in production. Set TAILSCALE_SERVER_IP env.')
+      process.exit(1)
+    }
+    console.warn('⚠️ Tailscale not detected, falling back to localhost for development')
+    return '127.0.0.1'
+  }
+}
+
+// ============================================
+// REQUEST SMUGGLING PROTECTION
+// ============================================
+function preventRequestSmuggling(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const hasTE = req.headers['transfer-encoding'] !== undefined
+  const hasCL = req.headers['content-length'] !== undefined
+  if (hasTE && hasCL) {
+    return res.status(400).send('Bad Request: ambiguous headers')
+  }
+  next()
+}
+
+// ============================================
+// WEB CACHE POISONING PROTECTION (strip client cache headers)
+// ============================================
+function stripCacheHeaders(req: express.Request, _res: express.Response, next: express.NextFunction) {
+  delete req.headers['cache-control']
+  delete req.headers['pragma']
+  delete req.headers['expires']
+  next()
+}
+
+// ============================================
+// SERVERS
+// ============================================
+
+const publicApp = express()
+publicApp.set('trust proxy', 1);
+
+publicApp.use(helmet())
+publicApp.use(cors({
+  origin: PUBLIC_CORS_ORIGIN,
+  credentials: true,
+  optionsSuccessStatus: 200
+}))
+if (process.env.NODE_ENV === 'production') {
+
+publicApp.use(systemLoadMiddleware);
+}
+publicApp.use(cookieParser());
+
+// ✅ Mount webhook endpoint with raw body parser BEFORE the global JSON parser
+publicApp.post(
+  '/api/public/calcom-webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    (req as any).rawBody = req.body;
+    try {
+      req.body = JSON.parse(req.body.toString());
+    } catch {
+      req.body = {};
+    }
+    await handleCalcomWebhook(req, res);
+  }
+);
+
+console.log('✅ Webhook route mounted at /api/public/calcom-webhook');
+
+publicApp.use(express.json({ limit: '10mb' }))
+publicApp.use(express.urlencoded({ extended: true }))
+// Clear body for GET/HEAD
+publicApp.use((req, _res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') req.body = undefined
+  if (NODE_ENV !== 'production') {
+    console.log(`[REQUEST] ${req.method} ${req.url}`);
+  }
+  next()
+})
+// Security middleware order: smuggling first, then cache stripping, then signature
+publicApp.use(preventRequestSmuggling)
+publicApp.use(stripCacheHeaders) // only for public routes (optional, but safe)
+
+publicApp.get('/health', async (_req, res) => {
+  const allConnected = Object.values(connections).every(c => c.connected)
+  res.status(allConnected ? 200 : 503).json({
+    status: allConnected ? 'ok' : 'degraded',
+    timestamp: new Date().toISOString(),
+    connections: Object.fromEntries(Object.entries(connections).map(([k, v]) => [k, v.connected]))
+  })
+})
+
+publicApp.use('/api/public', publicRoutes)
+publicApp.use(errorHandler)
+
+const adminApp = express()
+adminApp.set('trust proxy', 1);
+
+adminApp.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+}))
+
+adminApp.use(cors({
+  origin: ADMIN_CORS_ORIGIN,
+  credentials: true,
+  optionsSuccessStatus: 200
+}))
+if (process.env.NODE_ENV === 'production') {
+
+adminApp.use(systemLoadMiddleware);
+}
+adminApp.use(express.json({ limit: '50mb' }))
+adminApp.use(express.urlencoded({ extended: true }))
+adminApp.use((req, _res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') req.body = undefined
+  next()
+})
+
+adminApp.use(cookieParser())
+// Admin also needs smuggling protection (though Tailscale reduces risk)
+adminApp.use(preventRequestSmuggling)
+
+adminApp.use(validateTailscalePeer)
+  
+adminApp.get('/health', (_req, res) => {
+  res.json({ status: 'ok', tailscale: true, timestamp: new Date().toISOString() })
+})
+
+adminApp.use('/api/admin', adminRoutes)
+adminApp.use(errorHandler)
+
+// ============================================
+// STARTUP
+// ============================================
+
+async function startServers() {
+  // Connection managers will handle admin creation on first supabase connect
+  startConnectionManagers()
+  // Ensure standard product categories exist (idempotent)
+const standards = [
+  { name_fr: 'Tout',         name_ar: 'الكل',           slug: 'all',         order_index: 0 },
+  { name_fr: 'Top ventes',   name_ar: 'الأكثر مبيعاً',   slug: 'top-selling', order_index: 1 },
+  { name_fr: 'Nouveautés',   name_ar: 'الجديد',         slug: 'new',         order_index: 2 },
+  { name_fr: 'Recommandés',  name_ar: 'موصى به',        slug: 'recommended', order_index: 3 },
+  { name_fr: 'Promos',       name_ar: 'خصومات',         slug: 'discount',    order_index: 4 },
+  { name_fr: 'Packs',        name_ar: 'حزم',            slug: 'packages',    order_index: 5 },
+];
+for (const cat of standards) {
+  const { data: existing } = await supabase
+    .from('ProductCategory')
+    .select('id')
+    .eq('slug', cat.slug)
+    .maybeSingle();
+  if (!existing) {
+    await supabase.from('ProductCategory').insert({ ...cat, is_active: true });
+  }
+}
+console.log('✅ Standard product categories verified');
+  cron.schedule('*/5 * * * *', async () => {
+  // Only run if the feature flag is enabled
+  const { data } = await supabase
+    .from('FeatureFlag')
+    .select('is_enabled')
+    .eq('feature_name', 'cron_cal_sync')
+    .maybeSingle();
+
+  if (!data?.is_enabled) {
+    console.log('⏭️  Cal.com sync skipped – feature flag disabled');
+    return;
+  }
+
+  console.log('⏰ Running scheduled sync of Cal.com event types');
+  await syncCalEventTypes();
+});
+
+  cron.schedule('0 * * * *', async () => {
+  try {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    // List all images with tag 'booking-pending' and created before one hour ago
+    const result = await cloudinary.api.resources_by_tag('booking-pending', {
+      context: true,
+      max_results: 500,
+    });
+
+    const toDelete = result.resources
+      .filter((r: any) => new Date(r.created_at) < new Date(oneHourAgo))
+      .map((r: any) => r.public_id);
+
+    if (toDelete.length > 0) {
+      await cloudinary.api.delete_resources(toDelete);
+      console.log(`🧹 Cleaned up ${toDelete.length} abandoned booking images`);
+    }
+  } catch (err) {
+    console.error('❌ Error cleaning abandoned images:', err);
+  }
+});
+  cron.schedule('0 0 * * *', async () => {
+  const { error } = await supabase.from('Event').delete().lt('autoDeleteDate', new Date().toISOString());
+  if (error) console.error('Event cleanup error:', error);
+});
+cron.schedule('0 3 * * *', async () => {
+  const now = new Date();
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+  // ── 1. Soft‑delete cleanup (daily) ──────────────────────────
+  const { data: oldBookings } = await supabase
+    .from('Booking')
+    .select('id, image_public_id')
+    .not('deleted_at', 'is', null)
+    .lt('deleted_at', thirtyDaysAgo);
+
+  if (oldBookings) {
+    for (const booking of oldBookings) {
+      if (booking.image_public_id) await deleteCloudinaryImage(booking.image_public_id);
+    }
+    await supabase.from('Booking').delete().not('deleted_at', 'is', null).lt('deleted_at', thirtyDaysAgo);
+  }
+
+  for (const table of ['Message', 'Order', 'NewsletterSubscriber']) {
+    await supabase.from(table).delete().not('deleted_at', 'is', null).lt('deleted_at', thirtyDaysAgo);
+  }
+
+  const { data: oldProducts } = await supabase
+    .from('Product')
+    .select('id, image_public_id')
+    .not('deleted_at', 'is', null)
+    .lt('deleted_at', thirtyDaysAgo);
+
+  if (oldProducts) {
+    for (const product of oldProducts) {
+      if (product.image_public_id) await deleteCloudinaryImage(product.image_public_id);
+    }
+    await supabase.from('Product').delete().not('deleted_at', 'is', null).lt('deleted_at', thirtyDaysAgo);
+  }
+
+  // ── 2. Audit log cleanup (daily) ────────────────────────────
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  await supabase.from('AuditLog').delete().lt('createdAt', cutoff);
+
+  // ── 3. Worker salary anniversary (daily) ─────────────────────
+  const { data: activeWorkers } = await supabase
+    .from('Worker')
+    .select('id, firstName, lastName, salary, "joinedAt"')
+    .eq('isActive', true);
+
+  for (const w of activeWorkers ?? []) {
+    const joined = new Date(w.joinedAt);
+    const nowDate = new Date();
+
+    let monthsDiff =
+      (nowDate.getFullYear() - joined.getFullYear()) * 12 +
+      (nowDate.getMonth() - joined.getMonth());
+    if (nowDate.getDate() < joined.getDate()) monthsDiff--;
+
+    if (monthsDiff <= 0) continue;
+
+    const { count: existingCount } = await supabase
+      .from('FinancialEvent')
+      .select('id', { count: 'exact', head: true })
+      .eq('sourceId', w.id)
+      .eq('source', 'worker');
+
+    for (let i = existingCount ?? 0; i < monthsDiff; i++) {
+      const eventDate = new Date(joined);
+      eventDate.setMonth(eventDate.getMonth() + i + 1);
+
+      await logFinancialEvent({
+        source: 'worker',
+        sourceId: w.id,
+        field: 'salary',
+        oldValue: 0,
+        newValue: -Number(w.salary),
+        description: `Salaire mensuel – ${w.firstName} ${w.lastName} (${w.salary} TND) – mois de ${eventDate.toLocaleString('fr-FR', { month: 'long', year: 'numeric' })}`,
+      });
+    }
+  }
+
+  // ── 4. Fixed expense anniversary (daily) ───────────────────
+  const { data: activeExpenses } = await supabase
+    .from('FixedExpense')
+    .select('id, name, amount, "createdAt"')
+    .eq('isActive', true);
+
+  for (const e of activeExpenses ?? []) {
+    const created = new Date(e.createdAt);
+    const nowDate = new Date();
+
+    let monthsDiff =
+      (nowDate.getFullYear() - created.getFullYear()) * 12 +
+      (nowDate.getMonth() - created.getMonth());
+    if (nowDate.getDate() < created.getDate()) monthsDiff--;
+
+    if (monthsDiff <= 0) continue;
+
+    const { count: existingCount } = await supabase
+      .from('FinancialEvent')
+      .select('id', { count: 'exact', head: true })
+      .eq('sourceId', e.id)
+      .eq('source', 'expense');
+
+    for (let i = existingCount ?? 0; i < monthsDiff; i++) {
+      const eventDate = new Date(created);
+      eventDate.setMonth(eventDate.getMonth() + i + 1);
+
+      await logFinancialEvent({
+        source: 'expense',
+        sourceId: e.id,
+        field: 'amount',
+        oldValue: 0,
+        newValue: Number(e.amount),
+        description: `Charge fixe mensuelle – ${e.name} (${e.amount} TND) – mois de ${eventDate.toLocaleString('fr-FR', { month: 'long', year: 'numeric' })}`,
+      });
+    }
+  }
+});
+  cron.schedule('*/5 * * * *', async () => {
+  const count = parseInt(await redis.get('visitor:count:total') || '0');
+  if (count > 0) {
+    await redis.del('visitor:count:total');
+    await supabase.rpc('increment_visitors', { count });
+  }
+});
+  const tailscaleIP = await getTailscaleIP()
+  
+  const publicServer = publicApp.listen(PORT_PUBLIC, '0.0.0.0', () => {
+    console.log(`✅ Public API: http://localhost:${PORT_PUBLIC}`)
+  })
+  // Set server timeouts to mitigate slowloris and request smuggling
+  publicServer.requestTimeout = 120000 // 2 minutes (Node.js 18+)
+  publicServer.maxHeadersCount = 2000
+  
+  const adminServer = adminApp.listen(PORT_ADMIN, tailscaleIP, () => {
+    console.log(`🔒 Admin API: http://${tailscaleIP}:${PORT_ADMIN}`)
+  })
+  adminServer.requestTimeout = 120000
+  adminServer.maxHeadersCount = 2000
+  
+  console.log('\n🚀 Servers started')
+  console.log(`📋 Admin CORS allowed origins:`, ADMIN_CORS_ORIGIN)
+}
+
+// ============================================
+// SHUTDOWN
+// ============================================
+
+async function gracefulShutdown(signal: string) {
+  console.log(`\n${signal} received, shutting down...`)
+  try { await closeQueues() } catch {}
+  try { await redis.quit() } catch {}
+  process.exit(0)
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
+startServers()
+
+========================================
+
+FILE: backend\src\middleware\auth.ts
+
+========================================
+
+// ============================================================================
+// auth.ts — Unified authentication & authorization middleware
+// ============================================================================
+// Replaces: admin-auth.ts + authenticateToken/requireAdmin/verifyCsrf files.
+// Provides: authenticate, requireAdmin, csrfProtection.
+// ============================================================================
+
+import { Request, Response, NextFunction } from 'express';
+import { verifyToken, validateSession, logoutUser, createAndStoreSession } from '../services/auth-service.js';
+import { validateRefreshToken , revokeAllUserTokens } from '../services/token-service.js';
+import crypto from 'crypto';
+import { clearAuthCookies, clearAccessCookies } from '../lib/auth-cookies.js';
+
+
+// ---------- Refresh token validation cache ----------
+const refreshCache = new Map<string, { kind: string; expiresAt: number }>();
+const CACHE_TTL_MS = 3_000; // 3 seconds micro‑cache
+const MAX_CACHE_SIZE = 500;
+
+async function validateRefreshCached(token: string) {
+  const cached = refreshCache.get(token);
+  if (cached && cached.expiresAt > Date.now()) return cached.kind;
+
+  const result = await validateRefreshToken(token);
+  const entry = { kind: result.kind, expiresAt: Date.now() + CACHE_TTL_MS };
+  refreshCache.set(token, entry);
+
+  // Simple LRU‑ish eviction: if too big, clear oldest half
+  if (refreshCache.size > MAX_CACHE_SIZE) {
+    const entries = [...refreshCache.entries()];
+    entries.sort((a, b) => a[1].expiresAt - b[1].expiresAt);
+    const toDelete = entries.slice(0, Math.floor(entries.length / 2));
+    for (const [key] of toDelete) refreshCache.delete(key);
+  }
+
+  return result.kind;
+}
+
+// ============================================================================
+// 1. AUTHENTICATE — the single authentication middleware
+// ============================================================================
+export async function authenticate(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    // 1. Extract JWT
+    const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      clearAccessCookies(res);
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    }
+
+    // 2. Verify JWT (throws if invalid)
+    let decoded: any;
+    try {
+      decoded = verifyToken(token);
+    } catch {
+      clearAccessCookies(res);
+      res.status(401).json({ error: 'Invalid or expired token' });
+      return;
+    }
+
+    // 3. Admin role check early (needed for all routes that use this)
+    if (decoded.role !== 'ADMIN') {
+      clearAccessCookies(res);
+      res.status(403).json({ error: 'Admin access required' });
+      return;
+    }
+
+    // 4. Refresh token MUST be present and valid
+    const presentedRefresh = req.cookies?.refreshToken;
+    if (!presentedRefresh) {
+      clearAuthCookies(res);
+      await logoutUser(decoded.userId);
+      res.status(401).json({ error: 'Session invalidated – missing refresh token' });
+      return;
+    }
+
+       let rtKind: string;
+    try {
+      rtKind = await validateRefreshCached(presentedRefresh);
+    } catch (err) {
+      
+      if (err instanceof Error && err.message === 'SESSION_CHECK_UNAVAILABLE') {
+    return res.status(503).json({ error: 'Service temporarily unavailable' });
+  }
+  console.error('[AUTH] Redis error during refresh validation:', err);
+  return res.status(503).json({ error: 'Service temporarily unavailable' });
+    }
+
+    if (rtKind === 'invalid' || rtKind === 'reused' || rtKind === 'password_changed') {
+      clearAuthCookies(res);
+      await logoutUser(decoded.userId);
+      const code =
+        rtKind === 'password_changed' ? 'PASSWORD_CHANGED' :
+        rtKind === 'reused' ? 'TOKEN_REUSE' : 'INVALID_REFRESH';
+      res.status(401).json({
+        error: 'Session invalidated – refresh token no longer valid',
+        code,
+      });
+      return;
+    }
+    // 5. CSRF cookie MUST be present (every request)
+    if (!req.cookies?.csrf_token) {
+      clearAccessCookies(res);
+      await logoutUser(decoded.userId);
+      res.status(401).json({ error: 'Session invalidated – missing CSRF token' });
+      return;
+    }
+
+    // 6. Session integrity – if missing, rebuild automatically
+    // 6. Session integrity – must be valid
+const sessionValid = await validateSession(decoded.sessionId, req);
+if (!sessionValid) {
+  clearAuthCookies(res);                           // clear ALL three cookies
+  await logoutUser(decoded.userId);                // delete sessions
+  await revokeAllUserTokens(decoded.userId);      // kill all refresh tokens
+  res.status(401).json({ error: 'Session invalidated – security violation detected' });
+  return;
+}
+    // 7. Tailscale IP binding (from existing logic)
+    const clientTailscaleIP = (req as any).tailscaleClientIP;
+   if (!clientTailscaleIP || !decoded.tailscaleIP || clientTailscaleIP !== decoded.tailscaleIP) {
+  clearAuthCookies(res);
+  await logoutUser(decoded.userId);
+  await revokeAllUserTokens(decoded.userId);
+  res.status(401).json({ error: 'Network violation detected' });
+  return;
+}
+
+    // 8. Attach user to request
+    req.user = {
+      id: decoded.userId,
+      email: decoded.email,
+      role: 'ADMIN',
+      sessionId: decoded.sessionId,
+      tailscaleIP: decoded.tailscaleIP,
+      csrfToken: decoded.csrfToken,
+    };
+
+    next();
+  } catch {
+    clearAccessCookies(res);
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// ============================================================================
+// 2. requireAdmin — simple role guard (rarely needed because authenticate already checks ADMIN)
+// ============================================================================
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (req.user?.role !== 'ADMIN') {
+    res.status(403).json({ error: 'Admin access required' });
+    return;
+  }
+  next();
+}
+
+// ============================================================================
+// 3. csrfProtection — constant‑time CSRF header verification for mutations
+// ============================================================================
+export function csrfProtection(req: Request, res: Response, next: NextFunction): void {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    return next();
+  }
+
+  const csrfHeader = req.headers['x-csrf-token'] as string;
+  if (!csrfHeader) {
+    clearAccessCookies(res);
+    res.status(403).json({ error: 'CSRF token missing' });
+    return;
+  }
+
+  const tokenCsrf = req.user?.csrfToken;
+  if (!tokenCsrf) {
+    clearAccessCookies(res);
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const a = Buffer.from(String(tokenCsrf));
+  const b = Buffer.from(String(csrfHeader));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    clearAccessCookies(res);
+    res.status(403).json({ error: 'Invalid CSRF token' });
+    return;
+  }
+
+  next();
+}
+
+========================================
+
+FILE: backend\src\middleware\tailscale.ts
+
+========================================
+
+import { Request, Response, NextFunction } from 'express'
+import { getTailscalePeers, isTailscaleIP } from '../lib/tailscale.js'
+
+export async function validateTailscalePeer(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    // 1. Validate the immediate source IP (frontend server)
+    const sourceIP = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim()
+                     || req.socket.remoteAddress
+                     || req.ip
+  if (!sourceIP) {
+  console.log('[Tailscale] No source IP found');
+  res.status(404).json({ error: 'Not found' });
+  return;
+}
+    const strippedSource = sourceIP.replace(/^::ffff:/, '')
+
+    if (!strippedSource || !isTailscaleIP(strippedSource)) {
+      console.log('[Tailscale] Source IP not Tailscale:', strippedSource)
+      res.status(404).json({ error: 'Not found' }) ;
+      return;
+    }
+
+    const peers = await getTailscalePeers()
+    if (!peers.includes(strippedSource)) {
+      console.log('[Tailscale] Source IP not in peer list:', strippedSource)
+      res.status(404).json({ error: 'Not found' }) ;
+      return;
+    }
+
+    // 2. Validate the forwarded client IP (end user)
+    const clientIP = req.headers['x-forwarded-for'] as string
+    if (!clientIP) {
+      console.log('[Tailscale] Missing X-Forwarded-For header')
+     res.status(404).json({ error: 'Not found' }) ;
+      return;
+    }
+
+    const strippedClient = clientIP.split(',')[0].trim().replace(/^::ffff:/, '')
+    if (!strippedClient || !isTailscaleIP(strippedClient)) {
+      console.log('[Tailscale] Client IP not Tailscale:', strippedClient)
+      res.status(404).json({ error: 'Not found' }) ;
+      return;
+    }
+
+    if (!peers.includes(strippedClient)) {
+      console.log('[Tailscale] Client IP not in peer list:', strippedClient)
+      res.status(404).json({ error: 'Not found' }) ;
+      return;
+    }
+console.log('[Tailscale] Client IP:', strippedClient);
+    // Both IPs are valid Tailscale peers
+    ;(req as any).tailscaleSourceIP = strippedSource
+    ;(req as any).tailscaleClientIP = strippedClient
+    next()
+  } catch (error) {
+    console.error('[Tailscale] Validation error:', error)
+    res.status(404).json({ error: 'Not found' })
+  }
+}
+
+========================================
+
+FILE: backend\src\middleware\rate-limit.ts
+
+========================================
+
+import { Request, Response, NextFunction } from 'express'
+import redis from '../lib/redis.js'
+
+interface RateLimitConfig {
+  windowMs: number
+  maxRequests: number
+  keyPrefix: string
+}
+
+const DEFAULT_CONFIG: RateLimitConfig = {
+  windowMs: 15 * 60 * 1000,
+  maxRequests: 100,
+  keyPrefix: 'ratelimit'
+}
+
+const ENDPOINT_LIMITS: Record<string, RateLimitConfig> = {
+  '/api/public/auth/login': { windowMs: 15 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:login' },
+  '/api/public/auth/register': { windowMs: 60 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:register' },
+  '/api/public/auth/verify-2fa': { windowMs: 5 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:2fa' },
+  '/api/public/bookings': { windowMs: 60 * 60 * 1000, maxRequests: 10, keyPrefix: 'ratelimit:booking' },
+  '/api/public/contact': { windowMs: 60 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:contact' } , 
+  '/api/public/booking-init': { windowMs: 60 * 60 * 1000, maxRequests: 10, keyPrefix: 'ratelimit:booking-init' },
+  '/api/public/geo-lookup': { windowMs: 60 * 1000, maxRequests: 200, keyPrefix: 'ratelimit:geo' }
+}
+
+const AUTH_SENSITIVE_PREFIXES = ['login', 'register', '2fa', 'refresh', 'reset', 'forgot'];
+
+export function createRateLimiter(config: Partial<RateLimitConfig> = {}) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const finalConfig = { ...DEFAULT_CONFIG, ...config }
+    const endpointConfig = ENDPOINT_LIMITS[req.path] || finalConfig
+    const isAuthSensitive = AUTH_SENSITIVE_PREFIXES.some(p => endpointConfig.keyPrefix.includes(p));
+
+    const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown'
+    const fingerprint = req.headers['x-device-fingerprint'] || 'unknown'
+    const key = `${endpointConfig.keyPrefix}:${ip}:${fingerprint}`
+
+    try {
+      const ttl = Math.ceil(endpointConfig.windowMs / 1000)
+      const count = await redis.incr(key)
+      if (count === 1) { await redis.expire(key, ttl) }
+      if (count > endpointConfig.maxRequests) {
+        res.status(429).json({ error: 'Too many requests', retryAfter: ttl })
+        return
+      }
+      res.setHeader('X-RateLimit-Limit', endpointConfig.maxRequests.toString())
+      res.setHeader('X-RateLimit-Remaining', Math.max(0, endpointConfig.maxRequests - count).toString())
+      next()
+    } catch (err) {
+      console.error(`[RateLimit] Redis unavailable for ${key}:`, err);
+      if (isAuthSensitive) {
+        res.status(503).json({ error: 'Service temporarily unavailable, please try again shortly' });
+        return;
+      }
+      next();
+    }
+  }
+}
+
+========================================
+
+FILE: backend\src\middleware\system-load.ts
+
+========================================
+
+import { Request, Response, NextFunction } from 'express';
+import { isSystemHealthy, getSystemHealth } from '../services/system-metrics.js';
+
+// Routes that should always be allowed even under load (optional)
+const CRITICAL_ROUTES = ['/health', '/api/public/health'];
+
+export function systemLoadMiddleware(req: Request, res: Response, next: NextFunction) {
+  // Skip health check endpoints
+  if (CRITICAL_ROUTES.some(route => req.path.startsWith(route))) {
+    return next();
+  }
+
+  if (!isSystemHealthy()) {
+    const health = getSystemHealth();
+    // Log for monitoring
+    console.warn(`[SystemLoad] Rejecting request due to high load: CPU ${health.cpu.toFixed(1)}%, MEM ${health.memory.toFixed(1)}%, ELD ${health.eventLoopDelay.toFixed(2)}ms`);
+    
+    res.set('Retry-After', '30'); // seconds
+    return res.status(503).json({
+      error: 'Service temporarily unavailable due to high load',
+      retryAfter: 30,
+      reason: {
+        cpu: health.cpu,
+        memory: health.memory,
+        eventLoopDelay: health.eventLoopDelay,
+      },
+    });
+  }
+
+  next();
+}
+
+========================================
+
+FILE: backend\src\middleware\delete-code.ts
+
+========================================
+
+import { supabase } from '../lib/supabase.js';
+import { Request, Response, NextFunction } from 'express';
+import crypto from 'crypto'; 
+let cachedDeleteCode: string | null = null;
+let cacheTime = 0;
+const CACHE_TTL = 60_000;
+
+async function getDeleteCode(): Promise<string | null> {
+  const now = Date.now();
+  if (cachedDeleteCode !== undefined && now - cacheTime < CACHE_TTL) {
+    return cachedDeleteCode;
+  }
+  const { data } = await supabase
+    .from('SecretCode')
+    .select('code')
+    .eq('purpose', 'lock_delete')
+    .maybeSingle();
+  cachedDeleteCode = data ? data.code : null;
+  cacheTime = now;
+  return cachedDeleteCode;
+}
+
+export async function verifyDeleteCode(req: Request, res: Response, next: NextFunction) {
+  const { deleteCode } = req.body;
+  const correct = await getDeleteCode();
+
+  if (!deleteCode || typeof deleteCode !== 'string') {
+    return res.status(400).json({ error: 'Delete verification required' });
+  }
+  if (!correct) {
+    return res.status(400).json({ error: 'No delete verification code configured' });
+  }
+  const a = Buffer.from(String(deleteCode));
+  const b = Buffer.from(String(correct));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(400).json({ error: 'Invalid delete code' });
+  }
+  next();
+}
+
+========================================
+
+FILE: backend\src\routes\admin\auth.ts
+
+========================================
+
+import { Router, Request, Response } from 'express';
+import { randomBytes, timingSafeEqual } from 'crypto';
+import jwt from 'jsonwebtoken';
+import {
+  register,
+  hashPassword,
+  logoutUser,
+  validateSession,
+  verifyPassword,
+  generate2FACode,
+  createAndStoreSession,
+  adminExists,
+} from '../../services/auth-service.js';
+import {
+  COOKIE_OPTIONS,
+  CSRF_COOKIE_OPTIONS,
+  setAuthCookies,
+  clearAuthCookies,
+  clearAccessCookies,
+} from '../../lib/auth-cookies.js';
+
+import {
+  generateAccessToken,
+  generateRefreshToken,
+  validateRefreshToken,
+  rotateRefreshToken,
+  revokeRefreshFamily,
+  revokeAllUserTokens,
+} from '../../services/token-service.js';
+import { generateCsrfToken } from '../../lib/security/csrf.js';
+import { loginSchema, registerSchema, verify2FASchema, resetPasswordSchema } from '../../lib/validators/auth.js';
+import { createRateLimiter } from '../../middleware/rate-limit.js';
+import { supabase } from '../../lib/supabase.js';
+import { logAudit } from '../../lib/audit.js';
+import redis from '../../lib/redis.js';
+import { sendEmail, send2FACodeEmail } from '../../services/notification-service.js';
+import { authenticate, requireAdmin, csrfProtection } from '../../middleware/auth.js';
+import { sendTelegram } from '../../services/notification-service.js';
+const ADMIN_TELEGRAM_CHAT_ID = process.env.ADMIN_TELEGRAM_CHAT_ID;
+
+const JWT_SECRET = process.env.JWT_SECRET!;
+const SESSION_TTL_SECONDS = 30 * 60;
+const REFRESH_TOKEN_EXPIRY_DAYS = 7;
+
+const router = Router();
+
+// Rate limiters
+const loginLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:admin-login' });
+const registerLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 1, keyPrefix: 'ratelimit:admin-register' });
+const twoFALimiter = createRateLimiter({ windowMs: 5 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:admin-2fa' });
+const forgotLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:admin-forgot' });
+const resetLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 5, keyPrefix: 'ratelimit:admin-reset' });
+const resendLimiter = createRateLimiter({ windowMs: 5 * 60 * 1000, maxRequests: 3, keyPrefix: 'ratelimit:admin-resend' });
+const sessionInfoLimiter = createRateLimiter({ windowMs: 5 * 60 * 1000, maxRequests: 10, keyPrefix: 'ratelimit:admin-session-info' });
+const resetSessionInfoLimiter = createRateLimiter({ windowMs: 5 * 60 * 1000, maxRequests: 10, keyPrefix: 'ratelimit:admin-reset-session-info' });
+// NOTE: refresh has its own dedicated limiter now — see /refresh below.
+// It used to have none, which is itself worth closing (an unauthenticated
+// 401-spam endpoint with no rate limit is a free CPU-burn vector).
+const refreshLimiter = createRateLimiter({ windowMs: 60 * 1000, maxRequests: 10, keyPrefix: 'ratelimit:admin-refresh' });
+
+
+
+const TWO_FA_SESSION_TTL = 15 * 60;
+const TWO_FA_CODE_TTL = 5 * 60;
+const RESET_SESSION_TTL = 15 * 60;
+const RESET_CODE_TTL = 5 * 60;
+
+
+
+
+// Helper: full issuance of a fresh access+refresh+csrf triple for a user,
+// used by login / verify-2fa / the "fresh" branch of refresh.
+async function issueFullSession(
+  res: Response,
+  user: { id: string; email: string; role: string; passwordChangedAt: string },
+  req: Request,
+  geo: any
+) {
+  console.log('[ISSUE_FULL] geo received:', geo);
+
+  const sessionId = await createAndStoreSession(user.id, req, geo, {
+    tailscaleIP: (req as any).tailscaleClientIP,
+  });
+  const csrfToken = generateCsrfToken();
+  const accessToken = generateAccessToken({
+    userId: user.id,
+    email: user.email,
+    role: user.role,
+    sessionId,
+    tailscaleIP: (req as any).tailscaleClientIP,
+    csrfToken,
+    passwordEpoch: new Date(user.passwordChangedAt).getTime().toString(),
+  });
+const refreshToken = await generateRefreshToken(user.id, new Date(user.passwordChangedAt).getTime().toString(),  geo || null  );
+   setAuthCookies(res, accessToken, refreshToken, csrfToken);
+  return { sessionId, accessToken, refreshToken, csrfToken };
+}
+// POST /api/admin/auth/register
+router.post('/register', registerLimiter, async (req, res, next) => {
+  try {
+    const hasAdmin = await adminExists();
+    if (hasAdmin) {
+      logAudit({ action: 'REGISTER_FAILED', resource: 'User', req, success: false, metadata: { reason: 'Admin already exists', email: req.body.email } });
+      return res.status(403).json({ error: 'Registration disabled. System already has an administrator.' });
+    }
+
+    const validated = registerSchema.safeParse(req.body);
+    if (!validated.success) {
+      return res.status(400).json({ error: 'Validation failed', details: validated.error.errors.map(e => e.message).join(', ') });
+    }
+    const { email, password } = validated.data;
+
+    const user = await register({ email, password, role: 'ADMIN' });
+    logAudit({ userId: user.id, action: 'REGISTER', resource: 'User', resourceId: user.id, req, success: true, metadata: { email: user.email, role: 'ADMIN' } });
+    res.status(201).json({ success: true, user: { id: user.id, email: user.email, role: 'ADMIN' }, message: 'Admin account created. You are the system administrator.' });
+  } catch (error) {
+    if ((error as Error).message === 'Email already registered') {
+      logAudit({ action: 'REGISTER_FAILED', resource: 'User', req, success: false, metadata: { reason: 'Email already registered' } });
+      return res.status(409).json({ error: 'Email already registered' });
+    }
+    next(error as Error);
+  }
+});
+
+// POST /api/admin/auth/login
+router.post('/login', loginLimiter, async (req, res, next) => {
+ 
+
+  try {
+   
+    const validated = loginSchema.safeParse(req.body);
+    if (!validated.success) {
+      return res.status(400).json({ error: 'Validation failed', details: validated.error.errors.map(e => e.message).join(', ') });
+    }
+    const { email, password, geo } = validated.data;
+
+    // B: handle transient Supabase errors + timing-safe pw check
+   const { data: user, error: userErr } = await supabase
+  .from('User')
+  .select('id, email, role, passwordHash, twoFactorEnabled, passwordChangedAt')
+  .eq('email', email)
+  .single();
+
+if (userErr && userErr.code !== 'PGRST116') {
+  console.error('[LOGIN] Supabase lookup failed:', userErr);
+  return res.status(503).json({ error: 'Service temporarily unavailable, please try again' });
+}
+const DUMMY_HASH = '$2b$12$invalidhashinvalidhashinvalidhashinvalidha';
+const valid = await verifyPassword(password, user ? user.passwordHash : DUMMY_HASH);
+
+    if (!user || !valid) {
+      const failKey = `login_fails:${email}`;
+      const fails = await redis.incr(failKey);
+      await redis.expire(failKey, 900);
+
+      logAudit({ action: 'LOGIN_FAILED', resource: 'User', req, success: false, metadata: { email } });
+
+      if (fails >= 3 && process.env.ADMIN_TELEGRAM_CHAT_ID) {
+        await sendTelegram(process.env.ADMIN_TELEGRAM_CHAT_ID,
+          `⚠️ *Multiple failed login attempts*\n` +
+          `Email: ${email}\n` +
+          `IP: ${req.ip}\n` +
+          `UA: ${req.headers['user-agent']?.substring(0, 100)}`
+        ).catch(() => {});
+      }
+
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+
+    if (user.twoFactorEnabled) {
+      const sessionId = randomBytes(16).toString('hex');
+      const code = generate2FACode();
+      const sessionData = { userId: user.id, email: user.email, role: user.role, geo: geo || null, createdAt: Date.now() };
+
+      await redis.setex(`2fa:${sessionId}`, TWO_FA_SESSION_TTL, JSON.stringify(sessionData));
+      await redis.setex(`2fa_code:${sessionId}`, TWO_FA_CODE_TTL, code);
+      await redis.setex(`2fa_attempts:${sessionId}`, TWO_FA_SESSION_TTL, '0');
+
+      await send2FACodeEmail(user.email, code);
+      logAudit({ userId: user.id, action: 'LOGIN_2FA_REQUIRED', resource: 'User', req, success: true });
+      return res.json({ requires2FA: true, sessionId });
+    }
+    console.log('[LOGIN] about to issue full session, user:', user.id);
+
+await issueFullSession(res, user, req, geo || null);
+await supabase.from('User').update({ lastLoginAt: new Date().toISOString() }).eq('id', user.id);
+ logAudit({ userId: user.id, action: 'LOGIN', resource: 'User', req, success: true });
+
+    res.json({ success: true, user: { id: user.id, email: user.email, role: user.role } });
+  } catch (error) {
+    console.error('[LOGIN] Unexpected error:', error);
+    next(error as Error);
+  }
+});
+
+// POST /api/admin/auth/verify-2fa
+router.post('/verify-2fa', twoFALimiter, async (req, res, next) => {
+  try {
+    console.log('[2FA] --------------------------------------------------');
+    console.log('[2FA] Verification attempt');
+
+    const validated = verify2FASchema.safeParse(req.body);
+    if (!validated.success) {
+      console.log('[2FA] Zod validation failed:', validated.error.errors);
+      return res.status(400).json({ error: 'Invalid request', details: validated.error.errors.map(e => e.message).join(', ') });
+    }
+    const { sessionId, code } = validated.data;
+    console.log('[2FA] sessionId:', sessionId);
+
+    const sessionDataStr = await redis.get(`2fa:${sessionId}`);
+    if (!sessionDataStr) {
+      console.log('[2FA] No session data in Redis → 410 expired');
+      return res.status(410).json({ error: '2FA session expired' });
+    }
+    const sessionData = JSON.parse(sessionDataStr);
+    console.log('[2FA] Session user:', sessionData.email);
+
+    const attemptsKey = `2fa_attempts:${sessionId}`;
+    const attempts = parseInt((await redis.get(attemptsKey)) || '0');
+    console.log('[2FA] Attempts so far:', attempts);
+
+    if (attempts >= 3) {
+      await redis.del(`2fa:${sessionId}`);
+      await redis.del(`2fa_code:${sessionId}`);
+      await redis.del(attemptsKey);
+      console.log('[2FA] Too many attempts – cleared session');
+      return res.status(429).json({ error: 'Too many attempts. Please login again.' });
+    }
+
+    const storedCode = await redis.get(`2fa_code:${sessionId}`);
+    console.log('[2FA] Stored code:', storedCode, 'Provided code:', code);
+
+    if (!storedCode || storedCode !== code) {
+      await redis.incr(attemptsKey);
+      console.log('[2FA] Invalid code – incrementing attempts');
+      return res.status(400).json({ error: 'Invalid code' });
+    }
+
+    await redis.del(`2fa:${sessionId}`);
+    await redis.del(`2fa_code:${sessionId}`);
+    await redis.del(attemptsKey);
+    console.log('[2FA] Code matched – cleaned Redis keys');
+
+    const { data: user } = await supabase
+      .from('User')
+       .select('id, email, role, passwordChangedAt')
+      .eq('id', sessionData.userId)
+      .single();
+    console.log('[2FA] User fetch result:', user ? 'found' : 'not found');
+
+    if (!user) {
+      console.log('[2FA] User not found in DB – returning 401');
+      return res.status(401).json({ error: 'User not found' });
+    }
+await issueFullSession(res, user, req, sessionData.geo);
+console.log('[2FA] Full session issued');
+    logAudit({ userId: sessionData.userId, action: 'VERIFY_2FA_SUCCESS', resource: 'User', req, success: true });
+    res.json({ success: true, user: { id: sessionData.userId, email: sessionData.email, role: sessionData.role } });
+  } catch (error) {
+    console.error('[2FA] Unexpected error:', error);
+    next(error as Error);
+  }
+});
+
+// ----------------------------------------------------------------------
+// POST /api/admin/auth/refresh
+//
+// THE FIX: validateRefreshToken now returns a discriminated result instead
+// of a boolean. We branch on it explicitly:
+//   - 'fresh'  -> normal path, rotate and issue a new pair
+//   - 'retry'  -> the client is replaying a token we *just* rotated away
+//                 (proxy/network swallowed the previous response). Re-issue
+//                 a fresh access token bound to the SAME current refresh
+//                 token instead of rotating again or rejecting.
+//   - 'reused' -> token was valid once but is now stale beyond the grace
+//                 window — i.e. presented after the legitimate client
+//                 already moved on. Treat as compromise: revoke the whole
+//                 family and force re-login.
+//   - 'invalid'-> unknown/expired token, just 401.
+//
+// Also: NOT exempted from rate limiting (refreshLimiter), and we recommend
+// exempting this route from systemLoadMiddleware at the app-mounting level
+// (see notes below) so backend load doesn't masquerade as "your session
+// is invalid."
+// ----------------------------------------------------------------------
+router.post('/refresh', refreshLimiter, async (req, res, next) => {
+ 
+
+  
+console.log('[REFRESH] called');
+console.log('[REFRESH] refreshToken cookie present:', !!req.cookies?.refreshToken);
+  try {
+   
+    const presentedToken = req.cookies?.refreshToken;
+    console.log('refresh  : ' , presentedToken)
+   if (!presentedToken) {
+  clearAuthCookies(res);
+      console.log('refresh  : no preseted token ' )
+
+  return res.status(401).json({ error: 'Refresh token missing' });
+}
+
+let validation;
+try {
+  validation = await validateRefreshToken(presentedToken);
+} catch (err) {
+  console.error('[REFRESH] Redis error during token validation:', err);
+  return res.status(503).json({ error: 'Service temporarily unavailable, please try again shortly' });
+}
+    if (validation.kind === 'invalid') {
+              console.log('validation kind invalid ')
+
+      clearAuthCookies(res);
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
+
+    if (validation.kind === 'reused' || validation.kind === 'password_changed') {
+        console.log('validation kind reused or password changed  ' )
+      await revokeRefreshFamily(validation.familyId);
+              console.log('validation kind reused or password changed  : revok refresh family ')
+
+      clearAuthCookies(res);
+console.log('validation kind reused or password changed  : clearing auth cookies  ')
+      logAudit({
+        userId: validation.userId,
+        action: validation.kind === 'password_changed'
+          ? 'REFRESH_TOKEN_PASSWORD_CHANGED'
+          : 'REFRESH_TOKEN_REUSE_DETECTED',
+        resource: 'User',
+        req,
+        success: false,
+      });
+      const code = validation.kind === 'password_changed' ? 'PASSWORD_CHANGED' : 'TOKEN_REUSE';
+          console.log('refresh  : ' , code)
+console.log('[REFRESH] validation kind:', validation.kind);
+return res.status(401).json({
+    error: 'Session invalidated. Please log in again.',
+    code
+});
+    }
+
+    // C: user lookup with transient error handling
+   const { data: user, error: userErr } = await supabase
+  .from('User')
+  .select('id, email, role')
+  .eq('id', validation.userId)
+  .single();   
+
+   console.log('refresh  : ' , user)
+
+if (userErr && userErr.code !== 'PGRST116') {
+  console.error('[REFRESH] Supabase lookup failed:', userErr);
+  return res.status(503).json({ error: 'Service temporarily unavailable, please try again' });
+}
+
+if (!user) {
+  clearAuthCookies(res);
+  return res.status(401).json({ error: 'User no longer exists' });
+}
+const familyGeo = (validation as any).geoLocation || null;
+
+    // D handling: validateSession is called inside createAndStoreSession; if it throws SESSION_CHECK_UNAVAILABLE we catch it below.
+    try {
+      if (validation.kind === 'retry') {
+            console.log('refresh  : validation kind retry  ')
+
+       const sessionId = await createAndStoreSession(user.id, req, familyGeo, {
+  tailscaleIP: (req as any).tailscaleClientIP,
+});
+            console.log('refresh  : ' , sessionId)
+
+        const csrfToken = generateCsrfToken();
+            console.log('refresh  : ' , csrfToken)
+
+        const accessToken = generateAccessToken({
+          userId: user.id,
+          email: user.email,
+          role: user.role,
+          sessionId,
+          tailscaleIP: (req as any).tailscaleClientIP,
+          csrfToken,
+          passwordEpoch: validation.passwordUpdatedAt,
+        });
+            console.log('refresh  : ' , accessToken)
+
+        setAuthCookies(res, accessToken, validation.reissueToken, csrfToken);
+            console.log('refresh  : setting cookies' )
+
+        logAudit({ userId: user.id, action: 'TOKEN_REFRESH_RETRY', resource: 'User', req, success: true });
+        return res.json({ success: true, user: { id: user.id, email: user.email, role: user.role } });
+      }
+
+      // validation.kind === 'fresh'
+      const sessionId = await createAndStoreSession(user.id, req, familyGeo, {
+  tailscaleIP: (req as any).tailscaleClientIP,
+});
+          console.log('refresh  : ' , sessionId)
+
+      const csrfToken = generateCsrfToken();
+          console.log('refresh  : ' , csrfToken)
+
+      const accessToken = generateAccessToken({
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        sessionId,
+        tailscaleIP: (req as any).tailscaleClientIP,
+        csrfToken,
+        passwordEpoch: validation.passwordUpdatedAt,
+      });
+          console.log('refresh  : ' , accessToken)
+
+      const newRefreshToken = await rotateRefreshToken(validation.familyId, presentedToken);
+          console.log('refresh  : ' , newRefreshToken)
+
+if (!newRefreshToken) {
+  // Lost the race to another concurrent request (e.g. second tab) that
+  // rotated first. Re-validate — the other request's rotation already
+  // succeeded, so this one should now see itself as a valid 'retry'.
+      console.log('refresh  :  no new refresh toekn ')
+
+  const revalidation = await validateRefreshToken(presentedToken);
+      console.log('refresh  : ' , revalidation)
+
+  if (revalidation.kind === 'retry') {
+        console.log('refresh  : revalidation kind retry ')
+
+    setAuthCookies(res, accessToken, revalidation.reissueToken, csrfToken);
+    return res.json({ success: true, user: { id: user.id, email: user.email, role: user.role } });
+  }
+  clearAuthCookies(res);
+      console.log('refresh  : clearing cookies ')
+
+  return res.status(401).json({ error: 'Session invalidated. Please log in again.' });
+}
+      setAuthCookies(res, accessToken, newRefreshToken, csrfToken);
+      logAudit({ userId: user.id, action: 'TOKEN_REFRESH', resource: 'User', req, success: true });
+      res.json({ success: true, user: { id: user.id, email: user.email, role: user.role } });
+          } catch (err) {
+      // Any error during session creation / rotation is a transient infrastructure
+      // problem. Return 503 so the frontend retries, and DO NOT clear any cookies.
+      console.error('[REFRESH] Transient error during token rotation:', err);
+      return res.status(503).json({ error: 'Service temporarily unavailable' });
+    }
+ } catch (error) {
+    if (error instanceof Error && error.message === 'SESSION_CHECK_UNAVAILABLE') {
+      return res.status(503).json({ error: 'Service temporarily unavailable' });
+    }
+    // Any other unexpected error touching the refresh flow is treated as
+    // a sensitive-element failure per the rule, not a transient one —
+    // clear cookies and force re-login rather than letting the frontend
+    // retry a genuine bug 3 times against an unchanged failure.
+    console.error('[REFRESH] Unexpected error:', error);
+    clearAuthCookies(res);
+    return res.status(401).json({ error: 'Session invalidated due to an unexpected error. Please log in again.' });
+  }
+});
+// POST /api/admin/auth/logout
+router.post('/logout', async (req, res, next) => {
+  try {
+    const token = req.cookies?.token;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET) as any;
+        await logoutUser(decoded.userId, decoded.sessionId);
+        await revokeAllUserTokens(decoded.userId);
+        logAudit({ userId: decoded.userId, action: 'LOGOUT', resource: 'User', req, success: true });
+      } catch {}
+    }
+
+    clearAuthCookies(res);
+    res.json({ success: true });
+  } catch (error) {
+    next(error as Error);
+  }
+});
+
+// GET /api/admin/auth/me
+router.get('/me', authenticate, requireAdmin ,  async (req, res) => {
+  try {
+    const { data: user, error } = await supabase
+      .from('User')
+      .select('id, email, role, fullName')
+      .eq('id', req.user!.id)
+      .single();
+
+    if (error || !user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    res.json({ user: { ...user, tailscaleIp: req.user!.tailscaleIP } });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/admin/auth/verify-lock-code
+router.post('/verify-lock-code', authenticate, csrfProtection ,  async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'Code required' });
+
+  const { data } = await supabase
+    .from('SecretCode')
+    .select('code')
+    .eq('purpose', 'lock_delete')
+    .single();
+
+  if (data && data.code === code) {
+    return res.json({ success: true });
+  }
+  res.status(400).json({ error: 'Invalid code' });
+});
+
+// ----------------------------------------------------------------------
+// GET /api/admin/auth/status
+//
+// THE FIX: this endpoint is now READ-ONLY. It used to silently perform a
+// full refresh-and-rotate as a side effect of a status check, completely
+// outside of the frontend's refresh coordination (isRefreshing/refreshPromise
+// dedup, retry/backoff logic, etc). That meant a refresh token could be
+// rotated by a code path nothing else in the system knew about, which is
+// exactly the kind of invisible mutation that produces races like the one
+// you hit.
+//
+// Now: /status only inspects the access token. If it's missing/invalid, it
+// reports { user: null } and changes NOTHING — no cookie clearing, no
+// rotation. The frontend's existing explicit refreshSession() call (which
+// already runs immediately after a null /status response, see
+// SessionProvider) remains the ONLY code path that ever touches the
+// refresh token. One mutator, one place to reason about.
+// ----------------------------------------------------------------------
+router.get('/status', async (req, res) => {
+  try {
+    const token = req.cookies?.token;
+    const csrfCookie = req.cookies?.csrf_token;
+    const refreshTokenCookie = req.cookies?.refreshToken;
+console.log('[STATUS] token present:', !!token);
+console.log('[STATUS] csrfCookie present:', !!csrfCookie);
+console.log('[STATUS] refreshTokenCookie present:', !!refreshTokenCookie);
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET) as any;
+        const valid = await validateSession(decoded.sessionId, req);
+
+        // Constant‑time CSRF comparison (optional but bank‑grade)
+        const csrfOk =
+          !!csrfCookie &&
+          Buffer.byteLength(String(csrfCookie)) === Buffer.byteLength(String(decoded.csrfToken)) &&
+timingSafeEqual(Buffer.from(String(csrfCookie)), Buffer.from(String(decoded.csrfToken)))
+        const refreshPresent = !!refreshTokenCookie;
+
+        if (valid && csrfOk && refreshPresent) {
+          return res.json({
+            user: { id: decoded.userId, email: decoded.email, role: decoded.role },
+          });
+        }
+
+        // Partial cleanup – keep refresh token if present
+        if (refreshTokenCookie) {
+          res.clearCookie('token', COOKIE_OPTIONS);
+          res.clearCookie('csrf_token', CSRF_COOKIE_OPTIONS);
+        } else {
+          clearAuthCookies(res);
+        }
+        return res.json({ user: null });
+      } catch (err) {
+        console.warn('[STATUS] Token verification failed:', (err as Error).message);
+        if (refreshTokenCookie) {
+          res.clearCookie('token', COOKIE_OPTIONS);
+          res.clearCookie('csrf_token', CSRF_COOKIE_OPTIONS);
+        } else {
+          clearAuthCookies(res);
+        }
+        return res.json({ user: null });
+      }
+    }
+
+    return res.json({ user: null });
+  } catch (err) {
+    
+    console.error('[STATUS] Unexpected error:', err);
+    return res.json({ user: null });
+  }
+});
+
+// GET /2fa-session-info
+router.get('/2fa-session-info', sessionInfoLimiter, async (req, res) => {
+  const { sessionId } = req.query;
+  if (!sessionId || typeof sessionId !== 'string') return res.status(400).json({ error: 'sessionId required' });
+
+  const sessionTTL = await redis.ttl(`2fa:${sessionId}`);
+  if (sessionTTL <= 0) return res.status(410).json({ error: 'Session expired' });
+
+  const codeTTL = await redis.ttl(`2fa_code:${sessionId}`);
+  res.json({ sessionRemaining: sessionTTL, codeRemaining: codeTTL > 0 ? codeTTL : 0 });
+});
+
+// POST /api/admin/auth/forgot-password
+router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const { data: user } = await supabase.from('User').select('id, email').eq('email', email).eq('role', 'ADMIN').single();
+    if (!user) return res.json({ success: true, message: 'If an account exists, a reset code will be sent.' });
+
+    const code = generate2FACode();
+    const sessionData = { userId: user.id, email: user.email };
+    await redis.setex(`reset:${email}`, RESET_SESSION_TTL, JSON.stringify(sessionData));
+    await redis.setex(`reset_code:${email}`, 5 * 60, code);
+    await redis.setex(`reset_attempts:${email}`, RESET_SESSION_TTL, '0');
+    await sendEmail(user.email, 'Password Reset Code', 'password-reset', { code });
+    if (ADMIN_TELEGRAM_CHAT_ID) {
+      await sendTelegram(ADMIN_TELEGRAM_CHAT_ID,
+        `🔐 *Password reset requested*\nAdmin: ${user.email}\nIP: ${req.ip}`
+      ).catch(() => {});
+    }
+    logAudit({ userId: user.id, action: 'FORGOT_PASSWORD', resource: 'User', req, success: true });
+    res.json({ success: true, message: 'If an account exists, a reset code will be sent.' });
+  } catch (error) {
+    next(error as Error);
+  }
+});
+
+// POST /api/admin/auth/reset-password
+router.post('/reset-password', resetLimiter, async (req, res, next) => {
+  try {
+    const validated = resetPasswordSchema.safeParse(req.body);
+    if (!validated.success) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: validated.error.errors.map(e => e.message).join(', ')
+      });
+    }
+    const { email, code, newPassword } = validated.data;
+
+    const sessionStr = await redis.get(`reset:${email}`);
+    if (!sessionStr) {
+      return res.status(410).json({ error: 'Reset session expired. Please request a new code.' });
+    }
+
+    const attemptsKey = `reset_attempts:${email}`;
+    const attempts = parseInt((await redis.get(attemptsKey)) || '0');
+    if (attempts >= 3) {
+      await redis.del(`reset:${email}`);
+      await redis.del(`reset_code:${email}`);
+      await redis.del(attemptsKey);
+      return res.status(429).json({ error: 'Too many attempts. Please request a new code.' });
+    }
+
+    const storedCode = await redis.get(`reset_code:${email}`);
+    if (!storedCode || storedCode !== code) {
+      await redis.incr(attemptsKey);
+      return res.status(400).json({ error: 'Invalid code' });
+    }
+
+    const { userId } = JSON.parse(sessionStr);
+    const passwordHash = await hashPassword(newPassword);
+const now = new Date().toISOString();
+await supabase.from('User').update({ passwordHash, updatedAt: now, passwordChangedAt: now }).eq('id', userId);
+    await redis.del(`reset:${email}`);
+    await redis.del(`reset_code:${email}`);
+    await redis.del(attemptsKey);
+    await revokeAllUserTokens(userId);
+
+    logAudit({ userId, action: 'RESET_PASSWORD', resource: 'User', req, success: true });
+    if (ADMIN_TELEGRAM_CHAT_ID) {
+      await sendTelegram(ADMIN_TELEGRAM_CHAT_ID,
+        `✅ *Password reset*\nUser: ${email}\nIP: ${req.ip}`
+      ).catch(() => {});
+    }
+    res.json({ success: true, message: 'Password updated. Please log in again.' });
+  } catch (error) {
+    next(error as Error);
+  }
+});
+
+// POST /api/admin/auth/resend-2fa
+router.post('/resend-2fa', resendLimiter, async (req, res, next) => {
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+    const sessionDataStr = await redis.get(`2fa:${sessionId}`);
+    if (!sessionDataStr) return res.status(410).json({ error: '2FA session expired' });
+
+    const sessionData = JSON.parse(sessionDataStr);
+    const newCode = generate2FACode();
+    await redis.setex(`2fa_code:${sessionId}`, 5 * 60, newCode);
+    await redis.setex(`2fa_attempts:${sessionId}`, 5 * 60, '0');
+    await send2FACodeEmail(sessionData.email, newCode);
+    if (ADMIN_TELEGRAM_CHAT_ID) {
+      await sendTelegram(ADMIN_TELEGRAM_CHAT_ID,
+        `🔄 *2FA code resent*\nEmail: ${sessionData.email}\nIP: ${req.ip}`
+      ).catch(() => {});
+    }
+    res.json({ success: true, message: 'New code sent' });
+  } catch (error) {
+    next(error as Error);
+  }
+});
+
+// POST /api/admin/auth/resend-reset-code
+router.post('/resend-reset-code', resendLimiter, async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const sessionStr = await redis.get(`reset:${email}`);
+    if (!sessionStr) return res.status(410).json({ error: 'Reset session expired. Please request a new code.' });
+
+    const newCode = generate2FACode();
+    await redis.setex(`reset_code:${email}`, RESET_CODE_TTL, newCode);
+    await redis.setex(`reset_attempts:${email}`, RESET_SESSION_TTL, '0');
+    await sendEmail(email, 'New Password Reset Code', 'password-reset', { code: newCode });
+    if (ADMIN_TELEGRAM_CHAT_ID) {
+      await sendTelegram(ADMIN_TELEGRAM_CHAT_ID,
+        `🔄 *Reset code resent*\nEmail: ${email}\nIP: ${req.ip}`
+      ).catch(() => {});
+    }
+    res.json({ success: true, message: 'New reset code sent' });
+  } catch (error) {
+    next(error as Error);
+  }
+});
+
+// GET /reset-session-info
+  router.get('/reset-session-info', resetSessionInfoLimiter, async (req, res) => {
+  const { email } = req.query;
+  if (!email || typeof email !== 'string') return res.status(400).json({ error: 'email required' });
+
+  const sessionTTL = await redis.ttl(`reset:${email}`);
+  if (sessionTTL <= 0) return res.status(410).json({ error: 'Session expired' });
+
+  const codeTTL = await redis.ttl(`reset_code:${email}`);
+  res.json({ sessionRemaining: sessionTTL, codeRemaining: codeTTL > 0 ? codeTTL : 0 });
+});
+
+export default router;
+
+========================================
+
+FILE: backend\src\services\auth-service.ts
+
+========================================
+
+// ============================================================================
+// auth-service.ts — PATCH NOTES (reviewed against routes/auth.ts fix)
+// ============================================================================
+// This is your real auth-service.ts with ONE targeted change:
+// createAndStoreSession now accepts an optional `{ skipCleanup: true }` so
+// the grace-period 'retry' branch in auth.ts (POST /refresh) doesn't pay
+// for two Supabase DELETE queries on every retry. Everything else is
+// byte-for-byte what you already have — diff against your original to
+// confirm nothing else moved.
+//
+// WHY THIS MATTERS: the retry branch exists specifically to handle the
+// case where the backend was already struggling (that's what caused the
+// swallowed response in the first place). Making it pay full
+// session-creation cost (2 deletes + 1 insert + 1 redis write) every time
+// undermines the point of having a cheap retry path at all.
+// ============================================================================
+
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import { authenticator } from 'otplib';
+import { randomBytes, randomInt } from 'crypto';
+import redis from '../lib/redis.js';
+import { supabase } from '../lib/supabase.js';
+import { generateFingerprint, extractFromRequest } from '../lib/security/device-fingerprint.js';
+import { revokeAllUserTokens } from './token-service.js';
+const JWT_SECRET = process.env.JWT_SECRET!;
+const BCRYPT_ROUNDS = 12;
+const SESSION_TTL_SECONDS = 30 * 60; // 30 minutes
+const TWO_FA_CODE_TTL_SECONDS = 5 * 60; // 5 minutes
+
+export interface LoginCredentials {
+  email: string;
+  password: string;
+}
+
+export interface RegisterData {
+  email: string;
+  password: string;
+  role?: 'USER' | 'ADMIN';
+}
+
+export interface SessionData {
+  userId: string;
+  deviceFingerprint: string;
+  ipAddress: string;
+  geoLocation?: { city: string; country: string; lat: number; lon: number };
+  userAgent: string;
+  tailscaleIP?: string;
+}
+
+// ==================== Password Utilities ====================
+export async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, BCRYPT_ROUNDS);
+}
+
+export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(password, hash);
+}
+
+// ==================== JWT Utilities ====================
+export function verifyToken(token: string): any {
+  return jwt.verify(token, JWT_SECRET);
+}
+
+// ==================== 2FA Utilities ====================
+export function generate2FASecret(): string {
+  return authenticator.generateSecret();
+}
+
+export function verify2FAToken(token: string, secret: string): boolean {
+  return authenticator.verify({ token, secret });
+}
+
+export function generate2FACode(): string {
+  return randomInt(100000, 999999).toString().padStart(6, '0');
+}
+
+export async function store2FACode(sessionId: string, code: string): Promise<void> {
+  await redis.setex(`2fa:${sessionId}`, TWO_FA_CODE_TTL_SECONDS, code);
+}
+
+export async function verifyAndConsume2FACode(sessionId: string, code: string): Promise<boolean> {
+  const stored = await redis.get(`2fa:${sessionId}`);
+  if (!stored || stored !== code) return false;
+  await redis.del(`2fa:${sessionId}`);
+  return true;
+}
+
+// ==================== Session Management ====================
+/**
+ * Centralised session creation.
+ *
+ * FIX: added optional `opts.skipCleanup`. When true, skips the two
+ * Supabase DELETE queries that purge expired Session/RefreshToken rows for
+ * this user. Those deletes are correct and worth doing on a normal
+ * login/rotation, but are wasted, latency-adding work when this function
+ * is called repeatedly in quick succession for the same user — which is
+ * exactly what happens during a grace-period refresh retry. Cleanup still
+ * happens on every *normal* (non-retry) session creation, so expired rows
+ * don't accumulate unboundedly; retries just don't each re-trigger it.
+ */
+export async function createAndStoreSession(
+  userId: string,
+  req: any,
+  geo?: any,
+  extraData?: { tailscaleIP?: string }
+): Promise<string> {
+
+  // ── Clean up all expired sessions for this user ──
+ // ── Invalidate all existing sessions for this user (enforce one session per device) ──
+const fingerprint = generateFingerprint(extractFromRequest(req));   // already defined above, but ensure it's before this block
+console.log('[SESSION CREATE] fingerprint:', fingerprint);
+console.log('[SESSION CREATE] userId:', userId);
+console.log('[SESSION CREATE] callStack:', new Error().stack?.split('\n')[2]?.trim());
+ console.log('[SESSION CREATE] called', {
+    userId,
+    fingerprint,
+    geo,
+    tailscaleIP: extraData?.tailscaleIP,
+    callStack: new Error().stack?.split('\n')[2]?.trim()   // shows which route called it
+  });
+await supabase
+    .from('Session')
+    .delete()
+    .eq('userId', userId)
+    .eq('deviceFingerprint', fingerprint);
+
+  const sessionId = randomBytes(16).toString('hex');
+  console.log('[SESSION CREATE] inserted sessionId:', sessionId);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000);
+
+  const { error } = await supabase.from('Session').insert({
+    id: sessionId,
+    userId,
+    deviceFingerprint: fingerprint,
+    ipAddress: req.ip,
+    userAgent: req.headers['user-agent'],
+    geoLocation: geo || null,
+    expiresAt: expiresAt.toISOString(),
+  });
+
+  if (error) {
+    console.error('❌ Failed to create session in Supabase:', error);
+    throw new Error('Session creation failed');
+  }
+
+  if (extraData?.tailscaleIP) {
+    await supabase.from('User').update({ tailscaleIp: extraData.tailscaleIP }).eq('id', userId);
+  }
+
+  const sessionCache = {
+    userId,
+    role: 'ADMIN',    
+    deviceFingerprint: fingerprint,
+    ipAddress: req.ip,
+    userAgent: req.headers['user-agent'],
+    geoLocation: geo,
+    tailscaleIP: extraData?.tailscaleIP,
+    expiresAt: expiresAt.toISOString(),
+  };
+
+  await redis
+    .setex(`session:${sessionId}`, SESSION_TTL_SECONDS, JSON.stringify(sessionCache))
+    .catch(err => console.error('❌ Redis session caching failed:', err));
+  console.log('[SESSION CREATE] inserted sessionId:', sessionId);
+
+  return sessionId;
+}
+
+/**
+ * Validate a session.
+ * Checks Redis first; falls back to Supabase if missing.
+ * Performs integrity checks (strict for ADMIN).
+ */
+// ============================================================================
+// validateSession (rewritten – no double parse, full integrity checks)
+// ============================================================================
+export async function validateSession(sessionId: string, req: any): Promise<boolean> {
+  try {
+    // 1. Try Redis
+    const raw = await redis.get(`session:${sessionId}`);
+    if (raw) {
+      let session: any;
+      try {
+        session = JSON.parse(raw);
+        console.log('[VALIDATE SESSION] id:', sessionId, 'source:', raw ? 'redis' : 'supabase (fallback)');
+      } catch {
+        // corrupted → treat as missing (will try Supabase)
+        return await fallbackToSupabase(sessionId, req);
+      }
+
+      // Expired?
+      if (new Date(session.expiresAt) < new Date()) {
+        await redis.del(`session:${sessionId}`);
+        return await fallbackToSupabase(sessionId, req);
+      }
+
+      // Extend TTL if less than 10 minutes remaining (fire-and-forget)
+      const remainingMs = new Date(session.expiresAt).getTime() - Date.now();
+      if (remainingMs < 10 * 60 * 1000) {
+        const newExpiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+        session.expiresAt = newExpiresAt;
+        redis.setex(`session:${sessionId}`, 30 * 60, JSON.stringify(session)).catch(() => {});
+        supabase
+          .from('Session')
+          .update({ expiresAt: newExpiresAt })
+          .eq('id', sessionId)
+          .then(({ error }) => {
+            if (error) console.error('Session extension DB update failed:', error.message);
+          });
+      }
+
+      // Integrity check
+      return validateIntegrity(session, req);
+    }
+
+    // 2. Redis miss – fallback to Supabase
+    return await fallbackToSupabase(sessionId, req);
+  } catch (error) {
+    // Infrastructure errors (e.g. Redis timeout) should not crash the request
+    console.error('Session validation error:', error);
+    return false;
+  }
+}
+
+// ============================================================================
+// Internal fallback – Supabase lookup + cache back to Redis
+// ============================================================================
+async function fallbackToSupabase(sessionId: string, req: any): Promise<boolean> {
+  try {
+    const { data: session, error } = await supabase
+      .from('Session')
+      .select(`
+        id,
+        userId,
+        deviceFingerprint,
+        ipAddress,
+        geoLocation,
+        userAgent,
+        expiresAt,
+        user:User ( email, role )
+      `)
+      .eq('id', sessionId)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('Supabase session lookup failed:', error);
+      return false;
+    }
+    if (!session || new Date(session.expiresAt) < new Date()) {
+      return false;
+    }
+
+    const dataToCache = {
+      userId: session.userId,
+      email: (session.user as any).email,
+      role: (session.user as any).role,
+      deviceFingerprint: session.deviceFingerprint,
+      ipAddress: session.ipAddress,
+      geoLocation: session.geoLocation,
+      userAgent: session.userAgent,
+      tailscaleIP: req.tailscaleClientIP,   // best-effort: store the current Tailscale IP for future checks
+      expiresAt: session.expiresAt,
+    };
+
+    const remainingSecs = Math.floor((new Date(session.expiresAt).getTime() - Date.now()) / 1000);
+    await redis
+      .setex(`session:${sessionId}`, Math.max(remainingSecs, 1), JSON.stringify(dataToCache))
+      .catch(() => {});
+
+    return validateIntegrity(dataToCache, req);
+  } catch (err) {
+    console.error('Supabase fallback error:', err);
+    return false;
+  }
+}
+
+// ============================================================================
+// Integrity check – ADMIN sessions get strict enforcement
+// ============================================================================
+function validateIntegrity(session: any, req: any): boolean {
+  if (session.role !== 'ADMIN') return true;  // non‑admin are less strict for now
+
+  // 1. Device fingerprint
+  const currentFingerprint = generateFingerprint(extractFromRequest(req));
+   console.log('[INTEGRITY CHECK] session fingerprint:', session.deviceFingerprint);
+  console.log('[INTEGRITY CHECK] request fingerprint:', currentFingerprint);
+  if (session.deviceFingerprint !== currentFingerprint) {
+        console.warn('[INTEGRITY CHECK] MISMATCH – session:', session.deviceFingerprint, 'request:', currentFingerprint);
+
+    console.warn('Session integrity: device fingerprint mismatch');
+    return false;
+  }
+
+  // 2. User agent
+  const currentUA = req.headers['user-agent'];
+  if (session.userAgent !== currentUA) {
+    console.warn('Session integrity: user agent mismatch');
+    return false;
+  }
+
+  // 3. Tailscale IP (if stored)
+  if (session.tailscaleIP) {
+    const clientIP = (req as any).tailscaleClientIP;
+    if (clientIP && session.tailscaleIP !== clientIP) {
+      console.warn('Session integrity: Tailscale IP mismatch');
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ==================== User Management ====================
+export async function login(credentials: LoginCredentials, req: any): Promise<{
+  user: any;
+  sessionId: string;
+} | null> {
+  const { data: user, error } = await supabase
+    .from('User')
+    .select('*')
+    .eq('email', credentials.email)
+    .single();
+
+  if (error || !user) return null;
+
+  const validPassword = await verifyPassword(credentials.password, user.passwordHash);
+  if (!validPassword) return null;
+
+  const sessionId = await createAndStoreSession(user.id, req, req.body?.geo, {
+    tailscaleIP: (req as any).tailscaleClientIP,
+  });
+  await supabase
+    .from('User')
+    .update({ lastLoginAt: new Date().toISOString() })
+    .eq('id', user.id);
+
+  return { user, sessionId };
+}
+
+export async function register(data: RegisterData): Promise<any> {
+  const { data: existing } = await supabase
+    .from('User')
+    .select('id')
+    .eq('email', data.email)
+    .single();
+
+  if (existing) throw new Error('Email already registered');
+
+  const passwordHash = await hashPassword(data.password);
+  const now = new Date().toISOString();
+const { data: user, error } = await supabase
+  .from('User')
+  .insert({
+    email: data.email,
+    passwordHash,
+    role: data.role || 'USER',
+    createdAt: now,
+    updatedAt: now,
+    passwordChangedAt: now,       // initial password creation
+  })
+  .select('id, email, role')
+  .single();
+  if (error) {
+    console.error('Error creating user:', error);
+    throw new Error('Failed to create user');
+  }
+  return user;
+}
+
+export async function logoutUser(userId: string, sessionId?: string): Promise<void> {
+  if (sessionId) {
+    await redis.del(`session:${sessionId}`);
+  }
+  await supabase.from('Session').delete().eq('userId', userId);
+  await revokeAllUserTokens(userId);
+}
+export async function isTwoFactorEnabled(userId: string): Promise<boolean> {
+  const { data: user } = await supabase
+    .from('User')
+    .select('twoFactorEnabled')
+    .eq('id', userId)
+    .single();
+  return user?.twoFactorEnabled || false;
+}
+
+export async function adminExists(): Promise<boolean> {
+  const { data } = await supabase
+    .from('User')
+    .select('id')
+    .eq('role', 'ADMIN')
+    .limit(1);
+  return !!(data && data.length > 0);
+}
+
+export async function deleteUserByEmail(email: string): Promise<void> {
+  await supabase.from('User').delete().eq('email', email);
+}
+
+export async function createDefaultAdmin(): Promise<void> {
+ const { data: existingAdmin, error: adminCheckErr } = await supabase
+  .from('User')
+  .select('id')
+  .eq('role', 'ADMIN')
+  .limit(1);
+
+if (adminCheckErr) {
+  console.error('❌ Admin existence check failed, aborting default-admin creation:', adminCheckErr);
+  return;
+}
+if (existingAdmin && existingAdmin.length > 0) { console.log('✅ Admin already exists...'); return; }
+
+
+  console.log('🔧 No admin found. Creating default admin...');
+
+ const { data: existingUser, error: userCheckErr } = await supabase
+  .from('User')
+  .select('id, role')
+  .eq('email', 'admin@myshow.tn')
+  .single();
+
+if (userCheckErr && userCheckErr.code !== 'PGRST116') {
+  console.error('❌ Admin-email check failed, aborting default-admin creation:', userCheckErr);
+  return;
+}
+  const passwordHash = await hashPassword('admin123');
+
+  if (existingUser) {
+    const now = new Date().toISOString();
+    const { error: updateError } = await supabase
+      .from('User')
+      .update({
+        role: 'ADMIN',
+        passwordHash,
+        updatedAt: now,
+        passwordChangedAt: now,   // password is being set/reset
+      })
+      .eq('email', 'admin@myshow.tn');
+
+    if (updateError) {
+      console.error('Failed to upgrade user to admin:', updateError);
+      return;
+    }
+    console.log('✅ Existing user upgraded to ADMIN: admin@myshow.tn / admin123');
+    console.log('⚠️  Change password immediately after first login!');
+    return;
+  }
+
+ const now = new Date().toISOString();
+const { error: createError } = await supabase.from('User').insert({
+    email: 'admin@myshow.tn',
+    passwordHash,
+    role: 'ADMIN',
+    twoFactorEnabled: false,
+    fullName: 'Administrateur',
+    createdAt: now,
+    updatedAt: now,
+    passwordChangedAt: now,
+  });
+
+  if (createError) {
+    console.error('Failed to create default admin:', createError);
+    return;
+  }
+
+  console.log('✅ Default admin created: admin@myshow.tn / admin123');
+  console.log('⚠️  Change password immediately after first login!');
+}
+
+========================================
+
+FILE: backend\src\services\token-service.ts
+
+========================================
+
+// ============================================================================
+// token-service.ts — Grace‑period refresh token rotation (Redis‑based)
+// with password‑epoch validation.
+// ============================================================================
+
+import { randomBytes } from 'crypto';
+import jwt from 'jsonwebtoken';
+import redis from '../lib/redis.js';
+import { supabase } from '../lib/supabase.js';   // needed for password‑epoch check
+
+const JWT_SECRET = process.env.JWT_SECRET!;
+const ACCESS_TOKEN_EXPIRY = '30m';   // matches session TTL
+const REFRESH_TOKEN_EXPIRY_DAYS = 7;
+const REFRESH_TOKEN_TTL_SECONDS = REFRESH_TOKEN_EXPIRY_DAYS * 24 * 60 * 60;
+const ROTATION_GRACE_SECONDS = 120;
+
+export interface TokenPayload {
+  userId: string;
+  email: string;
+  role: string;
+  sessionId: string;
+  tailscaleIP?: string;
+  csrfToken: string;
+  passwordEpoch?: string;            // user’s updatedAt at the moment of issuance
+}
+
+interface RefreshFamilyRecord {
+  familyId: string;
+  userId: string;
+  currentToken: string;
+  previousToken: string | null;
+  previousExpiresAt: number | null;
+  passwordUpdatedAt: string;          // user.updatedAt when this family was created
+  issuedAccessTokenJti: string | null;
+  createdAt: number;
+   geoLocation?: any;  
+}
+
+function familyKey(familyId: string) {
+  return `refresh_family:${familyId}`;
+}
+
+function tokenIndexKey(token: string) {
+  return `refresh_token_idx:${token}`;
+}
+
+async function saveFamily(record: RefreshFamilyRecord) {
+  const key = familyKey(record.familyId);
+  await redis.set(key, JSON.stringify(record), 'EX', REFRESH_TOKEN_TTL_SECONDS);
+
+  await redis.set(tokenIndexKey(record.currentToken), record.familyId, 'EX', REFRESH_TOKEN_TTL_SECONDS);
+  if (record.previousToken) {
+    await redis.set(tokenIndexKey(record.previousToken), record.familyId, 'EX', ROTATION_GRACE_SECONDS);
+  }
+}
+
+/**
+ * Generate a short‑lived access token.
+ */
+export function generateAccessToken(payload: TokenPayload): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+}
+
+/**
+ * Start a brand‑new refresh‑token family. Call this on login / verify‑2fa.
+ * `passwordUpdatedAt` must be the user’s current `updatedAt` value.
+ */
+export async function generateRefreshToken(
+  userId: string,
+  passwordUpdatedAt: string,
+  geo?: any 
+): Promise<string> {
+  const familyId = randomBytes(16).toString('hex');
+  const token = randomBytes(32).toString('hex');
+
+  const record: RefreshFamilyRecord = {
+    familyId,
+    userId,
+    currentToken: token,
+    previousToken: null,
+    previousExpiresAt: null,
+    passwordUpdatedAt,
+    issuedAccessTokenJti: null,
+    createdAt: Date.now(),
+      geoLocation: geo || null, 
+  };
+
+  await saveFamily(record);
+  return token;
+}
+
+export type RefreshValidationResult =
+  | { kind: 'fresh'; userId: string; familyId: string; passwordUpdatedAt: string; geoLocation?: any }
+  | { kind: 'retry'; userId: string; familyId: string; reissueToken: string; passwordUpdatedAt: string; geoLocation?: any }
+  | { kind: 'password_changed'; userId: string; familyId: string }
+  | { kind: 'invalid' }
+  | { kind: 'reused'; userId: string; familyId: string };
+
+/**
+ * Validate a presented refresh token.
+ * Also checks the password epoch: if the password has changed since the
+ * token was issued, the token is immediately rejected with `password_changed`.
+ */
+export async function validateRefreshToken(
+  presentedToken: string
+): Promise<RefreshValidationResult> {
+  const familyId = await redis.get(tokenIndexKey(presentedToken));
+  if (!familyId) return { kind: 'invalid' };
+
+  const raw = await redis.get(familyKey(familyId));
+  if (!raw) return { kind: 'invalid' };
+
+  const record: RefreshFamilyRecord = JSON.parse(raw);
+
+  // ---------- PASSWORD‑EPOCH CHECK (with transient error handling) ----------
+  let user: { passwordChangedAt: string } | null = null;
+  let lastError: any = null;
+
+  // Retry once to survive a momentary Supabase blip
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await supabase
+        .from('User')
+        .select('passwordChangedAt')
+        .eq('id', record.userId)
+        .maybeSingle();
+      if (result.error) throw result.error;
+      user = result.data;
+      break;   // succeeded – exit retry loop
+    } catch (err) {
+      lastError = err;
+      if (attempt === 0) {
+        // Brief wait before retry
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+  }
+
+  if (!user && lastError) {
+    // Both attempts failed – this is an infrastructure problem, NOT a password change.
+    // Throw a specific error that the /refresh handler can map to 503.
+    throw new Error('SESSION_CHECK_UNAVAILABLE');
+  }
+
+  const dbEpoch = user?.passwordChangedAt
+    ? new Date(user.passwordChangedAt).getTime().toString()
+    : '0';
+  const storedEpoch = record.passwordUpdatedAt;
+  if (!user || dbEpoch !== storedEpoch) {
+    return {
+      kind: 'password_changed',
+      userId: record.userId,
+      familyId: record.familyId,
+    };
+  }
+
+  // ---------- NORMAL VALIDATION ----------
+  if (presentedToken === record.currentToken) {
+    return {
+      kind: 'fresh',
+      userId: record.userId,
+      familyId: record.familyId,
+      passwordUpdatedAt: record.passwordUpdatedAt,
+      geoLocation: record.geoLocation,
+    };
+  }
+
+  if (
+    record.previousToken &&
+    presentedToken === record.previousToken &&
+    record.previousExpiresAt &&
+    Date.now() < record.previousExpiresAt
+  ) {
+    return {
+      kind: 'retry',
+      userId: record.userId,
+      familyId: record.familyId,
+      reissueToken: record.currentToken,
+      passwordUpdatedAt: record.passwordUpdatedAt,
+      geoLocation: record.geoLocation,
+    };
+  }
+
+  // Token found in family but not current / not in‑grace previous → replay
+  return { kind: 'reused', userId: record.userId, familyId: record.familyId };
+}
+
+/**
+ * Rotate a refresh token after a *fresh* use.
+ */
+// Atomic compare-and-rotate: only rotates if the family record's
+// currentToken still equals what THIS caller validated moments ago.
+// Closes the double-tab race where two requests both read 'fresh'
+// before either rotates — the second writer here is rejected instead
+// of silently overwriting the first.
+const ROTATE_SCRIPT = `
+  local raw = redis.call('GET', KEYS[1])
+  if not raw then return nil end
+  local record = cjson.decode(raw)
+  if record.currentToken ~= ARGV[1] then return false end
+  record.previousToken = record.currentToken
+  record.previousExpiresAt = tonumber(ARGV[2])
+  record.currentToken = ARGV[3]
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
+  redis.call('SET', KEYS[2], record.familyId, 'EX', ARGV[4])
+  redis.call('SET', KEYS[3], record.familyId, 'EX', ARGV[5])
+  return cjson.encode(record)
+`;
+
+export async function rotateRefreshToken(familyId: string, expectedCurrentToken: string): Promise<string | null> {
+  const newToken = randomBytes(32).toString('hex');
+  const result = await redis.eval(
+    ROTATE_SCRIPT,
+    3,
+    familyKey(familyId),
+    tokenIndexKey(newToken),
+    tokenIndexKey(expectedCurrentToken),
+    expectedCurrentToken,
+    Date.now() + ROTATION_GRACE_SECONDS * 1000,
+    newToken,
+    REFRESH_TOKEN_TTL_SECONDS,
+    ROTATION_GRACE_SECONDS
+  );
+  if (result === false || result === null) return null; // someone else already rotated this — caller must re-validate
+  return newToken;
+}
+
+/**
+ * Revoke an entire refresh family immediately.
+ */
+export async function revokeRefreshFamily(familyId: string): Promise<void> {
+  const raw = await redis.get(familyKey(familyId));
+  if (raw) {
+    const record: RefreshFamilyRecord = JSON.parse(raw);
+    await redis.del(tokenIndexKey(record.currentToken));
+    if (record.previousToken) await redis.del(tokenIndexKey(record.previousToken));
+  }
+  await redis.del(familyKey(familyId));
+}
+
+/**
+ * Revoke all refresh families for a user (logout‑all, password reset).
+ */
+export async function revokeAllUserTokens(userId: string): Promise<void> {
+  let cursor = '0';
+  do {
+    const [next, keys] = await redis.scan(cursor, 'MATCH', 'refresh_family:*', 'COUNT', 100);
+    cursor = next;
+    for (const key of keys) {
+      const raw = await redis.get(key);
+      if (!raw) continue;
+      const record: RefreshFamilyRecord = JSON.parse(raw);
+      if (record.userId === userId) {
+        await revokeRefreshFamily(record.familyId);
+      }
+    }
+  } while (cursor !== '0');
+}    
+
+========================================
+
+FILE: backend\src\lib\security\device-fingerprint.ts
+
+========================================
+
+// backend/src/lib/security/device-fingerprint.ts
+// Generates unique device fingerprint from browser characteristics
+// Per documentation: backend/src/lib/security/device-fingerprint.ts
+
+import { createHash } from 'crypto'
+
+export interface DeviceCharacteristics {
+  userAgent: string
+  acceptLanguage: string
+  screenResolution?: string
+  timezone?: string
+  colorDepth?: number
+  pixelRatio?: number
+  touchSupport?: boolean
+  canvas?: string
+  webgl?: string
+  fonts?: string[]
+}
+
+export function generateFingerprint(characteristics: DeviceCharacteristics): string {
+  const components = [
+    characteristics.userAgent,
+    characteristics.acceptLanguage,
+    characteristics.screenResolution || '',
+    characteristics.timezone || '',
+    characteristics.colorDepth?.toString() || '',
+    characteristics.pixelRatio?.toString() || '',
+    characteristics.touchSupport?.toString() || '',
+    (characteristics.fonts || []).join(',')
+  ];
+  const data = components.join('|');
+  const hash = createHash('sha256').update(data).digest('hex');
+  console.log('[FINGERPRINT GENERATE] raw:', data);
+  console.log('[FINGERPRINT GENERATE] hash:', hash);
+  return hash;
+}
+
+// Extract characteristics from HTTP request
+export function extractFromRequest(req: any): DeviceCharacteristics {
+  const chars = {
+    userAgent: req.headers['user-agent'] || '',
+    acceptLanguage: req.headers['accept-language'] || '',
+    screenResolution: req.headers['x-screen-resolution'],
+    timezone: req.headers['x-timezone'],
+    colorDepth: req.headers['x-color-depth'] ? parseInt(req.headers['x-color-depth']) : undefined,
+    pixelRatio: req.headers['x-pixel-ratio'] ? parseFloat(req.headers['x-pixel-ratio']) : undefined,
+    touchSupport: req.headers['x-touch-support'] === 'true',
+    fonts: req.headers['x-fonts']?.split(',')
+  };
+  console.log('[FINGERPRINT EXTRACT]', JSON.stringify(chars, null, 2));
+  return chars;
+}
+
+========================================
+
+FILE: backend\src\lib\security\csrf.ts
+
+========================================
+
+import { randomBytes } from 'crypto';
+
+/**
+ * Generate a secure random CSRF token (32 bytes = 64 hex chars)
+ */
+export function generateCsrfToken(): string {
+  return randomBytes(32).toString('hex');
+}
+
+========================================
+
+FILE: backend\src\lib\auth-cookies.ts
+
+========================================
+
+// src/lib/auth-cookies.ts
+// Centralised cookie configuration and helpers.
+// Used by both auth middleware and auth router to avoid duplication.
+
+import { Response } from 'express';
+
+export const COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax' as const,
+  path: '/',
+};
+
+export const CSRF_COOKIE_OPTIONS = {
+  httpOnly: false,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict' as const,
+  path: '/',
+};
+
+export function setAuthCookies(
+  res: Response,
+  accessToken: string,
+  refreshToken: string,
+  csrfToken: string,
+  sessionTtlSeconds = 30 * 60,
+  refreshTtlDays = 7
+) {
+  res.cookie('token', accessToken, {
+    ...COOKIE_OPTIONS,
+    maxAge: sessionTtlSeconds * 1000,
+  });
+  res.cookie('refreshToken', refreshToken, {
+    ...COOKIE_OPTIONS,
+    maxAge: refreshTtlDays * 24 * 60 * 60 * 1000,
+  });
+  res.cookie('csrf_token', csrfToken, CSRF_COOKIE_OPTIONS);
+}
+
+export function clearAuthCookies(res: Response) {
+  res.clearCookie('token', COOKIE_OPTIONS);
+  res.clearCookie('refreshToken', COOKIE_OPTIONS);
+  res.clearCookie('csrf_token', CSRF_COOKIE_OPTIONS);
+}
+
+export function clearAccessCookies(res: Response) {
+  res.clearCookie('token', COOKIE_OPTIONS);
+  res.clearCookie('csrf_token', CSRF_COOKIE_OPTIONS);
+}
+
+========================================
+
+FILE: backend\src\lib\validators\auth.ts
+
+========================================
+
+// backend/src/lib/validators/auth.ts
+import { z } from 'zod'
+
+// Tunisian phone number validation regex
+const TUNISIAN_PHONE_REGEX = /^(?:(?:\+|00)216)?[2459]\d{7}$/
+
+// Email validation regex (optional, but can keep)
+const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/
+
+export const loginSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+  deviceFingerprint: z.string().optional() , 
+    geo: z.any().optional()
+
+})
+
+export const registerSchema = z.object({
+  email: z.string().email('Invalid email format').regex(EMAIL_REGEX),
+  password: z.string()
+    .min(8, 'Password must be at least 8 characters')
+    .regex(/[A-Z]/, 'Password must contain at least one uppercase letter')
+    .regex(/[a-z]/, 'Password must contain at least one lowercase letter')
+    .regex(/[0-9]/, 'Password must contain at least one number'),
+  confirmPassword: z.string(),
+}).refine((data) => data.password === data.confirmPassword, {
+  message: "Passwords don't match",
+  path: ["confirmPassword"]
+})
+
+// REPLACE your current verify2FASchema and any reset code schema with:
+export const verify2FASchema = z.object({
+  sessionId: z.string().min(1, 'Session ID required'),
+  code: z
+    .string()
+    .length(6, 'Code must be exactly 6 digits')
+    .regex(/^\d{6}$/, 'Code must be 6 digits'),
+});
+
+export const resetPasswordSchema = z.object({
+  email: z.string().email('Valid email required'),
+  code: z
+    .string()
+    .length(6, 'Code must be exactly 6 digits')
+    .regex(/^\d{6}$/, 'Code must be 6 digits'),
+  newPassword: z.string().min(8, 'Password must be at least 8 characters'),
+});
+
+// Profile schema (if needed)
+export const profileSchema = z.object({
+  email: z.string().email('Invalid email address').optional(),
+  phone: z.string().regex(TUNISIAN_PHONE_REGEX, 'Invalid Tunisian phone number').optional(),
+  firstName: z.string().min(2, 'First name must be at least 2 characters').optional(),
+  lastName: z.string().min(2, 'Last name must be at least 2 characters').optional(),
+})
+
+========================================
+
+FILE: backend\src\lib\redis.js (NOT FOUND)
+
+========================================
+
+
+========================================
+
+FILE: backend\src\lib\supabase.js (NOT FOUND)
+
+========================================
+
+
+========================================
+
+FILE: backend\src\lib\audit.ts
+
+========================================
+
+// backend/src/lib/audit.ts
+import { supabase } from './supabase.js';
+import { sendTelegram } from '../services/notification-service.js';
+
+export interface AuditData {
+  userId?: string;
+  action: string;
+  resource: string;
+  resourceId?: string;
+  req: any;
+  success: boolean;
+  errorMessage?: string;
+  metadata?: any;
+}
+
+const ADMIN_TELEGRAM_CHAT_ID = process.env.ADMIN_TELEGRAM_CHAT_ID;
+
+/**
+ * Log an audit event asynchronously (fire‑and‑forget).
+ * Critical failures are also sent to Telegram.
+ */
+export function logAudit(data: AuditData): void {
+  // Execute asynchronously to avoid blocking the request
+  (async () => {
+    try {
+      const { error } = await supabase.from('AuditLog').insert({
+  userId: data.userId,
+  action: data.action,
+  resource: data.resource,
+  resourceId: data.resourceId,
+  ipAddress: data.req.headers['x-forwarded-for'] || data.req.socket?.remoteAddress?.replace(/^::ffff:/, '') || data.req.ip || 'unknown',
+  userAgent: (data.req.headers['user-agent'] || 'unknown').substring(0, 256),
+  tailscaleIp: (data.req as any).tailscaleClientIP,
+  deviceFingerprint: (data.req.headers['x-device-fingerprint'] || '').substring(0, 64),
+  success: data.success,
+  errorMessage: data.errorMessage,
+  metadata: data.metadata ? JSON.stringify(data.metadata) : null,
+  createdAt: new Date().toISOString(),
+});
+
+      if (error) {
+        console.error('❌ Audit log insert failed:', error.message);
+      }
+
+      // Send Telegram alert for critical events
+      if (!data.success && ADMIN_TELEGRAM_CHAT_ID) {
+        const criticalActions = ['LOGIN_FAILED', 'UNAUTHORIZED_ACCESS', 'SESSION_INVALIDATED', 'RESET_PASSWORD'];
+        if (criticalActions.includes(data.action) || data.action.includes('FAILED')) {
+          await sendTelegram(ADMIN_TELEGRAM_CHAT_ID,
+            `🚨 *${data.action}*\n` +
+            `User: ${data.userId || 'unknown'}\n` +
+            `IP: ${data.req.ip}\n` +
+            `Resource: ${data.resource}\n` +
+            `Success: ${data.success}\n` +
+            `${data.errorMessage ? `Error: ${data.errorMessage}` : ''}`
+          ).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error('❌ Audit log exception:', err);
+    }
+  })();
+}
+
+========================================
+
+FILE: backend\src\services\notification-service.ts
+
+========================================
+
+// backend/src/services/notification-service.ts
+import { emailQueue, telegramQueue, EmailJobData } from '../lib/queue.js'
+
+export async function sendEmail(
+  to: string,
+  subject: string,
+  template: EmailJobData['template'],
+  data: Record<string, any>
+): Promise<void> {
+  await emailQueue.add('send-email', { to, subject, template, data })
+}
+
+export async function sendTelegram(
+  chatId: string,
+  message: string,
+  parseMode?: 'HTML' | 'Markdown'
+): Promise<void> {
+  await telegramQueue.add('send-telegram', { chatId, message, parseMode })
+}
+
+// Convenience methods for common notifications
+export async function send2FACodeEmail(email: string, code: string): Promise<void> {
+  await sendEmail(email, 'Your 2FA Code', '2fa-code', { code })
+}
+
+export async function sendExportReadyEmail(email: string, downloadUrl: string): Promise<void> {
+  await sendEmail(email, 'Your Export is Ready', 'export-ready', { downloadUrl })
+}
+
+========================================
+
+FILE: frontend\components\providers\SessionProvider.tsx
+
+========================================
+
+'use client';
+import { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
+import { useRouter, usePathname } from 'next/navigation';
+import { adminAPI } from '@/lib/api/client';
+import { performRefresh } from '@/lib/api/client';
+import { ServerOverloadError, UnauthorizedError } from '@/lib/api/types';
+import { useTranslations } from 'next-intl';
+
+// ── Debug toggle ──────────────────────────────────────────────────
+const DEBUG_SESSION = true; // set to false before production
+const log = (...args: any[]) => {
+  if (DEBUG_SESSION) {
+    const time = new Date().toLocaleTimeString();
+    console.log(`[Session] ${time} –`, ...args);
+  }
+};
+
+interface User {
+  id: string;
+  email: string;
+  role: 'ADMIN';
+  fullName?: string;
+}
+
+interface SessionContextType {
+  user: User | null;
+  loading: boolean;
+  refreshSession: () => Promise<boolean>;
+}
+
+const SessionContext = createContext<SessionContextType>({
+  user: null,
+  loading: true,
+  refreshSession: async () => false,
+});
+// Singleton – ensures only one refresh call runs at a time across all components
+let refreshPromise: Promise<void> | null = null;
+export function SessionProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [serverUnavailable, setServerUnavailable] = useState(false);
+  const router = useRouter();
+  const pathname = usePathname();
+  const refreshTimerRef = useRef<NodeJS.Timeout>();
+  const checkedPathRef = useRef<string>('');
+const firstMount = useRef(true);
+const [recoveryKey, setRecoveryKey] = useState(0);
+  const t = useTranslations('admin.session');
+
+  const isAdminRoute = pathname?.startsWith('/admin') || pathname?.split('/')[2] === 'admin';
+  const isAuthPage =
+    pathname?.includes('/login') ||
+    pathname?.includes('/verify-2fa') ||
+    pathname?.includes('/forgot-password') ||
+    pathname?.includes('/reset-password');
+
+ const refreshSession = useCallback(async (): Promise<boolean> => {
+  // If a refresh is already in progress, wait for it to finish
+  if (refreshPromise) {
+    try {
+      await refreshPromise;
+      return true; // the previous refresh succeeded
+    } catch {
+      return false; // the previous refresh failed
+    }
+  }
+
+  refreshPromise = (async () => {
+    try {
+      await performRefresh();
+      log('refresh succeeded');
+    } catch (error) {
+      if (error instanceof ServerOverloadError) {
+        log('refresh failed (transient)');
+        throw error; // let the caller decide to retry
+      }
+      log('refresh failed (auth) – token is invalid');
+      throw error; // non‑transient – caller will handle
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  try {
+    await refreshPromise;
+    return true;
+  } catch (error) {
+    return false;
+  }
+}, []);
+
+ const checkSession = useCallback(async (): Promise<{ user: User | null; transient: boolean }> => {
+  log('checking /auth/status');
+  try {
+    const data = await adminAPI<{ user: User | null }>('/auth/status');
+    if (data.user) {
+      log('status returned valid user:', data.user.email);
+      return { user: data.user, transient: false };
+    }
+  } catch (err) {
+    if (err instanceof ServerOverloadError) {
+      log('/status transient failure');
+      return { user: null, transient: true };
+    }
+    log('/status returned error (non-transient):', err);
+  }
+
+  // Status returned null – always attempt refresh.
+  // The browser automatically sends the HttpOnly refreshToken cookie,
+  // so we don’t need to (and can’t) check it via document.cookie.
+  log('status returned null, attempting refresh...');
+  try {
+   const success = await refreshSession();
+if (!success) {
+  // refresh failed – logged out
+  return { user: null, transient: false };
+}
+
+    const newData = await adminAPI<{ user: User | null }>('/auth/status');
+    log('post-refresh status user:', !!newData.user);
+    return { user: newData.user, transient: false };
+  } catch (err) {
+    if (err instanceof ServerOverloadError) {
+      log('refresh transient failure');
+      return { user: null, transient: true };
+    }
+    log('refresh failed (non-transient) – treating as logged out');
+    return { user: null, transient: false };
+  }
+}, []);
+
+  const scheduleProactiveRefresh = useCallback(() => {
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = setTimeout(async () => {
+      try {
+        const success = await refreshSession();
+        if (success) {
+          scheduleProactiveRefresh();
+        } else {
+          log('proactive refresh failed, redirecting to login');
+          if (isAdminRoute) router.push('/fr/login?reason=session_expired');
+        }
+      } catch (error) {
+        if (error instanceof ServerOverloadError) {
+          log('proactive refresh transient error, retrying in 30s');
+          refreshTimerRef.current = setTimeout(() => scheduleProactiveRefresh(), 30000);
+        }
+      }
+    }, 12 * 60 * 1000);
+  }, [refreshSession, isAdminRoute, router]);
+
+  useEffect(() => {
+    const isProtectedRoute = isAdminRoute || isAuthPage;
+    if (!isProtectedRoute) {
+      setLoading(false);
+      return;
+    }
+
+    // Run recovery only on first mount or when the user is actually missing.
+    if (firstMount.current || !user) {
+      firstMount.current = false;
+
+      let cancelled = false;
+      let retryCount = 0;
+      const MAX_RETRIES = 5;
+
+      const attemptRecovery = async () => {
+        if (cancelled) return;
+
+        // Step 1 – call /status
+        try {
+          const data = await adminAPI<{ user: User | null }>('/auth/status');
+          if (cancelled) return;
+          if (data.user) {
+            setUser(data.user);
+            setLoading(false);
+            setServerUnavailable(false);
+            if (isAdminRoute) scheduleProactiveRefresh();
+            // On auth pages, follow the redirect parameter
+            if (isAuthPage) {
+              const params = new URLSearchParams(window.location.search);
+              const redirectTarget = params.get('redirect');
+              const locale = pathname.split('/')[1];
+              router.push(redirectTarget ?? `/${locale}/admin/dashboard`);
+            }
+            return;
+          }
+        } catch (err) {
+          if (err instanceof ServerOverloadError) {
+            // transient – retry with backoff
+            if (retryCount < MAX_RETRIES) {
+              retryCount++;
+              const delay = Math.pow(2, retryCount) * 1000;
+              setTimeout(attemptRecovery, delay);
+              return;
+            }
+            setServerUnavailable(true);
+            setLoading(false);
+            return;
+          }
+          // other errors – treat as not logged in (fall through to refresh attempt)
+        }
+
+        // Step 2 – /status said null, try refreshing the session
+        try {
+          const refreshed = await performRefresh();
+          if (!refreshed) throw new Error('Refresh failed');
+          const newData = await adminAPI<{ user: User | null }>('/auth/status');
+          if (cancelled) return;
+          if (newData.user) {
+            setUser(newData.user);
+            setLoading(false);
+            setServerUnavailable(false);
+            if (isAdminRoute) scheduleProactiveRefresh();
+            return;
+          }
+        } catch (err) {
+          if (err instanceof ServerOverloadError) {
+            // transient
+            if (retryCount < MAX_RETRIES) {
+              retryCount++;
+              setTimeout(attemptRecovery, Math.pow(2, retryCount) * 1000);
+              return;
+            }
+            setServerUnavailable(true);
+            setLoading(false);
+            return;
+          }
+        }
+
+        // Step 3 – definitely logged out
+        document.cookie =
+          'csrf_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; samesite=strict';
+        setLoading(false);
+        if (isAdminRoute) {
+          const locale = pathname.split('/')[1];
+          router.push(`/${locale}/login?reason=unauthorized`);
+        }
+      };
+
+      setLoading(true);
+      attemptRecovery();
+
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [isAdminRoute, isAuthPage, router, scheduleProactiveRefresh, pathname, recoveryKey]);  // Safety timeout – if still loading after 2 minutes, show error
+  useEffect(() => {
+    if (!loading) return;
+    const timeout = setTimeout(() => {
+      setLoading(false);
+      setServerUnavailable(true);
+      log('session loading timeout after 2 minutes');
+    }, 120000);
+    return () => clearTimeout(timeout);
+  }, [loading]);
+
+ const handleManualRetry = () => {
+  setServerUnavailable(false);
+  setLoading(true);
+  setRecoveryKey(k => k + 1);
+};
+  // ── Loading spinner ──────────────────────────────────────────────
+  if (loading) {
+    return (
+      <div className="fixed inset-0 flex items-center justify-center bg-cream z-50">
+        <div className="text-center">
+          <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-gray-500 text-sm">{t('verifying')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Server unavailable (all retries exhausted) ─────────────────────
+  if (serverUnavailable) {
+    return (
+      <div className="fixed inset-0 flex items-center justify-center bg-cream z-50">
+        <div className="text-center max-w-sm">
+          <div className="w-20 h-20 mx-auto mb-6 text-gray-400">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+            </svg>
+          </div>
+          <h2 className="text-xl font-bold mb-2">{t('unreachable')}</h2>
+          <p className="text-gray-500 mb-6 text-sm">
+            {t('unreachableMessage')}
+          </p>
+          <div className="flex gap-3 justify-center">
+            <button
+              onClick={handleManualRetry}
+              className="px-6 py-3 bg-primary text-white rounded-xl font-semibold hover:bg-primary/90 transition"
+            >
+              {t('retry')}
+            </button>
+            <button
+              onClick={() => router.push('/fr/login')}
+              className="px-6 py-3 bg-gray-100 text-gray-700 rounded-xl font-semibold hover:bg-gray-200 transition"
+            >
+              {t('logout')}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <SessionContext.Provider value={{ user, loading, refreshSession }}>
+      {children}
+    </SessionContext.Provider>
+  );
+}
+
+export const useSession = () => useContext(SessionContext);
+
+========================================
+
+FILE: frontend\lib\api\client.ts
+
+========================================
+
+// frontend/lib/api/client.ts
+import { ApiError, UnauthorizedError, RateLimitError, ServerOverloadError } from './types';
+
+export const PUBLIC_API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
+export const ADMIN_API_URL = process.env.NEXT_PUBLIC_ADMIN_API_URL || 'http://localhost:4001';
+
+// Refresh state management
+let isRefreshing = false;
+let refreshPromise: Promise<boolean> | null = null;
+const REFRESH_COOLDOWN_MS = 5000;
+let lastRefreshResolvedAt = 0;
+let lastRefreshResult: boolean | null = null;
+let refreshSubscribers: ((error?: Error) => void)[] = [];
+let cachedFingerprint: string | null = null;
+
+function subscribeTokenRefresh(cb: (error?: Error) => void) {
+  refreshSubscribers.push(cb);
+}
+
+function onTokenRefreshed() {
+  refreshSubscribers.forEach(cb => cb());
+  refreshSubscribers = [];
+}
+
+function onTokenRefreshFailed(error: Error) {
+  refreshSubscribers.forEach(cb => cb(error));
+  refreshSubscribers = [];
+}
+
+// ----------------------------------------------------------------------
+// THE FIX (core of the race condition)
+// ----------------------------------------------------------------------
+// Previously: any non-401/400 failure (503, network error, etc.) that
+// survived 3 retry attempts fell through to clearAuthCookies() + redirect
+// to /login?reason=session_expired — even though a 503 says NOTHING about
+// whether the session/refresh token is valid. It only says the backend was
+// briefly unavailable.
+//
+// Now: we explicitly distinguish two outcomes:
+//   - AUTH-INVALID  (401/400 from the refresh endpoint itself): the token
+//     really is bad. Clear cookies, force re-login. This is correct and
+//     unchanged.
+//   - TRANSIENT (503, network error, timeout, retries exhausted): we do
+//     NOT touch cookies and we do NOT force a redirect. We surface a
+//     distinguishable failure (ServerOverloadError) so callers — e.g.
+//     SessionProvider — can decide to show "we're having trouble
+//     connecting" UI and try again later, rather than logging the user out
+//     of a perfectly valid session.
+//
+// This pairs with the backend fix (grace-period refresh rotation +
+// /auth/refresh exempted from load-shedding) — together they mean a 503
+// during refresh no longer has any path to deleting a good session.
+export async function performRefresh(): Promise<boolean> {
+  if (isRefreshing && refreshPromise) return refreshPromise;
+      console.log('performrefresh  :  isrefresh and refreshpromise ' )
+
+const sinceLastRefresh = Date.now() - lastRefreshResolvedAt;
+      console.log('performrefresh  : ' , sinceLastRefresh)
+
+if (lastRefreshResult !== null && sinceLastRefresh < REFRESH_COOLDOWN_MS) return lastRefreshResult;
+  isRefreshing = true;
+  refreshPromise = (async () => {
+    let lastTransientError: Error | null = null;
+
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const csrf = getCsrfTokenFromCookie();
+const fingerprintHeaders: Record<string, string> = {};
+if (typeof window !== 'undefined') {
+    fingerprintHeaders['X-Screen-Resolution'] = `${window.screen.width}x${window.screen.height}`;
+    fingerprintHeaders['X-Timezone'] = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    fingerprintHeaders['X-Color-Depth'] = window.screen.colorDepth?.toString() || '';
+    fingerprintHeaders['X-Pixel-Ratio'] = window.devicePixelRatio?.toString() || '';
+    fingerprintHeaders['X-Touch-Support'] = ('ontouchstart' in window).toString();
+}
+const headers: Record<string, string> = {
+    ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+    ...fingerprintHeaders,
+};
+const res = await fetch('/api/admin/auth/refresh', {
+    method: 'POST',
+    credentials: 'include',
+    headers,
+});
+      console.log('performrefresh  : ' , res)
+
+          if (res.ok) {
+                  console.log('performrefresh  : refresh.ok dsuccess' )
+
+            onTokenRefreshed(); lastRefreshResolvedAt = Date.now(); lastRefreshResult = true; return true;
+          } else {
+    let body;
+    try { body = await res.json(); } catch {}
+    console.log('[performRefresh] failure body:', body);
+}
+
+          // Refresh endpoint explicitly says the token is bad — this is a
+          // real auth failure, not a transient one. Clear cookies and stop
+          // retrying immediately.
+         if (res.status === 401 || res.status === 400 || res.status === 403) {
+  const error = new UnauthorizedError('Session expired');
+  onTokenRefreshFailed(error);
+  clearAuthCookies();
+  redirectToLogin('session_expired');
+  throw error;
+}
+          // Anything else (503 from load-shedding, 502/504 from a flaky
+          // proxy hop, etc.) is transient — retry with backoff, but do NOT
+          // treat it as proof the session is invalid.
+          lastTransientError = new ServerOverloadError(
+            'Refresh endpoint temporarily unavailable',
+            parseInt(res.headers.get('Retry-After') || '5', 10)
+          );
+          if (attempt < 2) {
+            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+            continue;
+          }
+        } catch (err) {
+          if (err instanceof UnauthorizedError) throw err;
+
+          // Network-level failure (fetch threw) — also transient.
+          lastTransientError = err as Error;
+          if (attempt < 2) {
+            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+            continue;
+          }
+        }
+      }
+
+      // All 3 attempts were transient failures — the backend was
+      // unreachable/overloaded throughout, but we have no evidence the
+      // refresh token itself is bad. Do NOT clear cookies. Surface the
+      // transient error so the caller can show a "reconnecting" state
+      // instead of bouncing the user to /login.
+      onTokenRefreshFailed(lastTransientError!);
+      throw lastTransientError;
+    } finally {
+      isRefreshing = false;
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+}
+
+function redirectToLogin(reason: string) {
+  if (typeof window !== 'undefined' && !window.location.pathname.includes('/login')) {
+    window.location.href = `/login?reason=${reason}`;
+  }
+}
+
+function clearAuthCookies() {
+  const tokenOpts = 'path=/; samesite=lax';
+  const csrfOpts = 'path=/; samesite=strict';
+  document.cookie = `token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; ${tokenOpts}`;
+  document.cookie = `refreshToken=; expires=Thu, 01 Jan 1970 00:00:00 UTC; ${tokenOpts}`;
+  document.cookie = `csrf_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; ${csrfOpts}`;
+}
+
+function isServerOverloaded(response: Response): boolean {
+  return response.status === 503;
+}
+
+// ----------------------------------------------------------------------
+// CSRF Token Helper
+// ----------------------------------------------------------------------
+function getCsrfTokenFromCookie(): string | null {
+  if (typeof document === 'undefined') return null;
+  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+// ----------------------------------------------------------------------
+// Device Fingerprint (unchanged)
+// ----------------------------------------------------------------------
+export async function getDeviceFingerprint(): Promise<string> {
+  if (cachedFingerprint) return cachedFingerprint;
+  if (typeof window === 'undefined') return 'server-side';
+
+  const components: string[] = [
+    navigator.userAgent,
+    navigator.language,
+    screen.colorDepth.toString(),
+    screen.width.toString(),
+    screen.height.toString(),
+    new Date().getTimezoneOffset().toString(),
+    (navigator.hardwareConcurrency || 'unknown').toString(),
+    (navigator.deviceMemory || 'unknown').toString(),
+  ];
+
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = 200; canvas.height = 50;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.textBaseline = 'top'; ctx.font = '14px Arial';
+      ctx.fillStyle = '#f60'; ctx.fillRect(0, 0, 100, 50);
+      ctx.fillStyle = '#069'; ctx.fillText('Myshow.tn', 2, 15);
+      components.push(canvas.toDataURL().slice(0, 100));
+    }
+  } catch {}
+
+  try {
+    const gl = document.createElement('canvas').getContext('webgl') ||
+               (document.createElement('canvas') as any).getContext('experimental-webgl');
+    if (gl) {
+      const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+      if (debugInfo) {
+        components.push(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL));
+        components.push(gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL));
+      }
+    }
+  } catch {}
+
+  const encoder = new TextEncoder();
+  const data = encoder.encode(components.join('|'));
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  cachedFingerprint = hashHex.slice(0, 32);
+  return cachedFingerprint;
+}
+
+// ----------------------------------------------------------------------
+// Core request function
+// ----------------------------------------------------------------------
+async function request<T>(
+  baseUrl: string,
+  endpoint: string,
+  options?: RequestInit,
+  retry = true
+): Promise<T> {
+  const fingerprintHeaders: Record<string, string> = {};
+
+  if (typeof window !== 'undefined') {
+    fingerprintHeaders['X-Screen-Resolution'] = `${window.screen.width}x${window.screen.height}`;
+    fingerprintHeaders['X-Timezone'] = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    fingerprintHeaders['X-Color-Depth'] = window.screen.colorDepth?.toString() || '';
+    fingerprintHeaders['X-Pixel-Ratio'] = window.devicePixelRatio?.toString() || '';
+    fingerprintHeaders['X-Touch-Support'] = ('ontouchstart' in window).toString();
+
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 200; canvas.height = 50;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.textBaseline = 'top'; ctx.font = '14px Arial';
+        ctx.fillStyle = '#f60'; ctx.fillRect(0, 0, 100, 50);
+        ctx.fillStyle = '#069'; ctx.fillText('Myshow.tn', 2, 15);
+        fingerprintHeaders['X-Canvas-Fingerprint'] = canvas.toDataURL().slice(0, 100);
+      }
+    } catch {}
+
+    try {
+      const gl = document.createElement('canvas').getContext('webgl');
+      if (gl) {
+        const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+        if (debugInfo) {
+          fingerprintHeaders['X-WebGL-Fingerprint'] = `${gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)}|${gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL)}`;
+        }
+      }
+    } catch {}
+  }
+
+  const fingerprint = await getDeviceFingerprint();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Device-Fingerprint': fingerprint,
+    ...(options?.headers as Record<string, string>),
+  };
+  Object.assign(headers, fingerprintHeaders);
+
+  const csrfToken = getCsrfTokenFromCookie();
+  if (csrfToken && options?.method && !['GET', 'HEAD'].includes(options.method)) {
+    headers['X-CSRF-Token'] = csrfToken;
+  }
+headers['X-Request-Timestamp'] = new Date()
+  .toISOString()
+  .replace('T', ' ')
+  .replace(/\.\d{3}Z$/, ' +0000');
+  const url = `${baseUrl}${endpoint}`;
+  let response: Response;
+  const isFormData = options?.body instanceof FormData;
+  if (isFormData) {
+    delete headers['Content-Type'];
+  }
+  try {
+    response = await fetch(url, {
+      ...options,
+      headers,
+      credentials: 'include',
+    });
+  } catch (fetchError: any) {
+    const isConnectionRefused =
+      fetchError?.message?.includes('ERR_CONNECTION_REFUSED') ||
+      (fetchError?.name === 'TypeError' &&
+        fetchError?.message === 'Failed to fetch' &&
+        typeof navigator !== 'undefined' &&
+        navigator.onLine);
+
+    if (isConnectionRefused) {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('backend-down'));
+      }
+      throw new ApiError('Service temporarily unavailable', 'BACKEND_DOWN', 0);
+    }
+    throw fetchError;
+  }
+
+  const AUTH_ENDPOINTS_NO_REFRESH = [
+    '/auth/login',
+    '/auth/verify-2fa',
+    '/auth/resend-2fa',
+    '/auth/forgot-password',
+    '/auth/reset-password',
+    '/auth/resend-reset-code',
+    '/auth/reset-session-info',
+    '/auth/2fa-session-info',
+    '/auth/refresh',
+    '/auth/status',
+  ];
+
+  if (response.status === 401 && retry) {
+    if (AUTH_ENDPOINTS_NO_REFRESH.some(e => endpoint.includes(e))) {
+      const data = await response.json().catch(() => ({}));
+      throw new ApiError(data.error || 'Unauthorized', 'UNAUTHORIZED', 401);
+    }
+
+   try {
+  const refreshed = await performRefresh();
+  if (refreshed) {
+    const freshCsrf = getCsrfTokenFromCookie();
+    const retryOptions: RequestInit = { ...options };
+    if (freshCsrf && options?.method && !['GET', 'HEAD'].includes(options.method)) {
+      retryOptions.headers = {
+        ...(options?.headers as Record<string, string>),
+        'X-CSRF-Token': freshCsrf,
+      };
+    }
+    // Retry the original request once
+    try {
+      return await request<T>(baseUrl, endpoint, retryOptions, false);
+    } catch (retryErr) {
+      // If the retry still fails with 401, the session is dead — force logout
+      if (retryErr instanceof UnauthorizedError) {
+        clearAuthCookies();
+        redirectToLogin('session_expired');
+        throw retryErr;
+      }
+      throw retryErr; // other errors (transient) propagate normally
+    }
+  }
+} catch (error) {
+  // performRefresh threw — it's already handled inside performRefresh (calls clearAuthCookies/redirect for real failures)
+  throw error;
+}
+  }
+
+  const contentType = response.headers.get('content-type');
+  if (!contentType || !contentType.includes('application/json')) {
+    const text = await response.text();
+    throw new ApiError('Invalid response', 'INVALID_RESPONSE', response.status);
+  }
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    if (response.status === 503) {
+      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('backend-overload'));
+      const retryAfter = response.headers.get('Retry-After') || '30';
+      throw new ServerOverloadError('Server under high load', parseInt(retryAfter));
+    }
+    if (response.status === 429) {
+      const retryAfter = parseInt(response.headers.get('Retry-After') || '60', 10);
+      if (
+        options?.method && ['GET', 'HEAD'].includes(options.method) &&
+        baseUrl === PUBLIC_API_URL
+      ) {
+        window.dispatchEvent(new CustomEvent('backend-rate-limit'));
+      }
+      throw new RateLimitError(data.error || 'Rate limit exceeded', retryAfter);
+    }
+    throw new ApiError(data.error || 'Request failed', data.code, response.status);
+  }
+
+  return data as T;
+}
+
+// ----------------------------------------------------------------------
+// Public API
+// ----------------------------------------------------------------------
+export async function publicAPI<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  return request<T>(PUBLIC_API_URL, `/api/public${endpoint}`, options);
+}
+
+// ----------------------------------------------------------------------
+// Admin API (relative path – goes through Next.js proxy)
+// ----------------------------------------------------------------------
+export async function adminAPI<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  return request<T>('', `/api/admin${endpoint}`, options);
+}
+
+// ----------------------------------------------------------------------
+// Session status
+// ----------------------------------------------------------------------
+export async function getSessionStatus() {
+  try {
+    const data = await adminAPI<{ user: any }>('/auth/status');
+    return data.user;
+  } catch {
+    return null;
+  }
+}
+
+// ----------------------------------------------------------------------
+// Login
+// ----------------------------------------------------------------------
+export async function login(email: string, password: string, geo?: any) {
+  const data = await adminAPI<any>('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password, geo }),
+  });
+  if (data.requires2FA) {
+    return { requires2FA: true, sessionId: data.sessionId };
+  }
+  return data;
+}
+
+// ----------------------------------------------------------------------
+// Verify 2FA
+// ----------------------------------------------------------------------
+export async function verify2FA(sessionId: string, code: string) {
+  return await adminAPI<any>('/auth/verify-2fa', {
+    method: 'POST',
+    body: JSON.stringify({ sessionId, code }),
+  });
+}
+
+// ----------------------------------------------------------------------
+// Resend 2FA code
+// ----------------------------------------------------------------------
+export async function resend2FA(sessionId: string) {
+  return await adminAPI<any>('/auth/resend-2fa', {
+    method: 'POST',
+    body: JSON.stringify({ sessionId }),
+  });
+}
+
+// ----------------------------------------------------------------------
+// Resend password reset code
+// ----------------------------------------------------------------------
+export async function resendResetCode(email: string) {
+  return await adminAPI<any>('/auth/resend-reset-code', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  });
+}
+
+// ----------------------------------------------------------------------
+// Logout
+// ----------------------------------------------------------------------
+export async function logout() {
+  try {
+    await adminAPI('/auth/logout', { method: 'POST' });
+  } finally {
+    window.location.href = '/login';
+  }
+}
+
+========================================
+
+FILE: frontend\lib\api\types.ts
+
+========================================
+
+// frontend/lib/api/types.ts
+
+export interface User {
+  id: string
+  email: string
+  role: 'USER' | 'ADMIN'
+  createdAt: string
+}
+
+export interface Booking {
+  id: string
+  eventId: string
+  date: string
+  childrenCount: number
+  status: 'PENDING' | 'CONFIRMED' | 'CANCELLED'
+  totalPrice: number
+  paymentStatus: 'PENDING' | 'PAID' | 'FAILED' | 'REFUNDED'
+  notes?: string
+  createdAt: string
+}
+
+export interface AdminBooking extends Booking {
+  user: Pick<User, 'email'>
+  event: Pick<Event, 'titleFr' | 'titleAr'>
+}
+
+export interface Event {
+  id: string
+  titleFr: string
+  titleAr: string
+  descriptionFr: string
+  descriptionAr: string
+  date: string
+  capacity: number
+  availableSlots: number
+  price: number
+  location: string
+}
+
+export interface Product {
+  id: string
+  nameFr: string
+  nameAr: string
+  descriptionFr: string
+  descriptionAr: string
+  price: number
+  stock: number
+  category: string
+  imageUrl?: string
+}
+
+export interface Message {
+  id: string
+  name: string
+  email: string
+  phone?: string
+  message: string
+  status: 'NEW' | 'READ' | 'REPLIED'
+  adminNotes?: string
+  createdAt: string
+}
+
+export interface Settings {
+  deleteVerificationCode: string
+  sessionTimeoutMinutes: number
+  notificationEmail?: string
+  telegramChatId?: string
+  language: 'fr' | 'ar'
+}
+
+// Error classes
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public code?: string,
+    public status?: number
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+export class RateLimitError extends ApiError {
+  public retryAfter: number;
+
+  constructor(message: string = 'Too many requests', retryAfter?: number) {
+    super(message, 'RATE_LIMIT', 429);
+    this.retryAfter = retryAfter ?? 60; // default 60s
+  }
+}
+export class ServerOverloadError extends ApiError {
+  public retryAfter: number;
+  constructor(message: string, retryAfter: number) {
+    super(message, 'SERVER_OVERLOAD', 503);
+    this.retryAfter = retryAfter;
+  }
+}
+
+
+export class UnauthorizedError extends ApiError {
+  constructor(message: string = 'Unauthorized') {
+    super(message, 'UNAUTHORIZED', 401);
+  }
+}
+
+========================================
+
+FILE: frontend\lib\api\hooks.ts
+
+========================================
+
+// frontend/lib/api/hooks.ts
+import { useState, useEffect, useCallback } from 'react'
+import { publicAPI, adminAPI } from './client'
+import { withErrorHandling } from './error-handler'
+import { ApiError, ServerOverloadError, RateLimitError } from './types'
+import { getRateLimitCooldown, setRateLimit, clearRateLimit } from './rate-limit-cache';
+import useSWR from 'swr'
+
+
+const publicFetcher = (url: string) => withErrorHandling(publicAPI(url), { showToast: true });
+const adminFetcher = (url: string) => withErrorHandling(adminAPI(url), { showToast: true });
+
+// Generic fetch hook
+export function useAPI<T>(
+  fetcher: () => Promise<T>,
+  deps: any[] = []
+) {
+  const [data, setData] = useState<T | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<ApiError | null>(null)
+
+  useEffect(() => {
+    let mounted = true
+
+    const fetchData = async () => {
+      try {
+        setLoading(true)
+        const result = await withErrorHandling(fetcher(), { showToast: false })
+        if (mounted) {
+          setData(result)
+          setError(null)
+        }
+      } catch (err) {
+        if (mounted) {
+          setError(err as ApiError)
+        }
+      } finally {
+        if (mounted) {
+          setLoading(false)
+        }
+      }
+    }
+
+    fetchData()
+
+    return () => {
+      mounted = false
+    }
+  }, deps)
+
+  return { data, loading, error }
+}
+
+// Hook for public GET requests
+export function usePublicGET<T>(
+  endpoint: string,
+  deps: any[] = []
+) {
+  return useAPI(() => publicAPI<T>(endpoint), [endpoint, ...deps])
+}
+
+// Hook for admin GET requests
+export function useAdminGET<T>(
+  endpoint: string,
+  deps: any[] = []
+) {
+  return useAPI(() => adminAPI<T>(endpoint), [endpoint, ...deps])
+}
+
+// Mutation hooks (POST, PUT, DELETE)
+export function useMutation<T, D = any>(
+  apiFunction: (data: D) => Promise<T>,
+  options?: { showToast?: boolean; endpoint?: string }
+) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<ApiError | null>(null);
+
+  const mutate = useCallback(
+    async (data: D): Promise<T> => {
+      // Check client‑side rate limit
+      if (options?.endpoint) {
+        const cooldown = getRateLimitCooldown(options.endpoint);
+        if (cooldown !== null) {
+          const err = new RateLimitError('Too many requests', cooldown);
+          setError(err);
+          throw err;   // no backend call, immediate rejection
+        }
+      }
+
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await withErrorHandling(apiFunction(data), {
+          showToast: options?.showToast ?? true,
+        });
+        // Successful call → clear any cached limit for this endpoint
+        if (options?.endpoint) clearRateLimit(options.endpoint);
+        return result;
+      } catch (err) {
+        if (err instanceof RateLimitError && options?.endpoint) {
+          // Cache the cooldown so future calls are blocked
+          setRateLimit(options.endpoint, err.retryAfter);
+        }
+        setError(err as ApiError);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [apiFunction, options?.showToast]
+  );
+
+  return { trigger: mutate, mutate, loading, error };
+}
+
+// Specific mutation creators
+export function usePublicPOST<T, D = any>(endpoint: string, options?: { showToast?: boolean }) {
+  return useMutation<T, D>(
+    (data) =>
+      publicAPI<T>(endpoint, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    { showToast: options?.showToast ?? true, endpoint }
+  );
+}
+
+export function usePublicPUT<T, D = any>(endpoint: string) {
+  return useMutation<T, D>(
+    (data) =>
+      publicAPI<T>(endpoint, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    { endpoint }
+  );
+}
+
+export function usePublicDELETE<T>(endpoint: string) {
+  return useMutation<T, void>(
+    () =>
+      publicAPI<T>(endpoint, {
+        method: 'DELETE',
+      }),
+    { endpoint }
+  );
+}
+
+export function useAdminPOST<T, D = any>(
+  endpoint: string | (() => string),
+  options?: { showToast?: boolean }
+) {
+  const resolveEndpoint = typeof endpoint === 'function' ? endpoint : () => endpoint;
+  return useMutation<T, D>(
+    (data) =>
+      adminAPI<T>(resolveEndpoint(), {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    { showToast: options?.showToast ?? true, endpoint: typeof endpoint === 'string' ? endpoint : undefined }
+  );
+}
+
+export function useAdminPUT<T, D = any>(
+  endpoint: string | (() => string),
+  options?: { showToast?: boolean }
+) {
+  const resolveEndpoint = typeof endpoint === 'function' ? endpoint : () => endpoint;
+  return useMutation<T, D>(
+    (data) =>
+      adminAPI<T>(resolveEndpoint(), {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    { showToast: options?.showToast ?? true, endpoint: typeof endpoint === 'string' ? endpoint : undefined }
+  );
+}
+export function useAdminDELETE<T, D = any>(
+  endpoint: string | (() => string)
+) {
+  const resolveEndpoint = typeof endpoint === 'function' ? endpoint : () => endpoint;
+
+  return useMutation<T, D>(
+    (data) =>
+      adminAPI<T>(resolveEndpoint(), {
+        method: 'DELETE',
+        body: JSON.stringify(data),
+      }),
+    { endpoint: typeof endpoint === 'string' ? endpoint : undefined }
+  );
+}
+
+export function usePublicGETSWR<T>(endpoint: string, options?: any) {
+  const [retriesExhausted, setRetriesExhausted] = useState(false);
+  const { data, error, mutate, isValidating } = useSWR<T>(endpoint, publicFetcher, {
+    revalidateOnFocus: false,
+    revalidateIfStale: false, // MAGIC BULLET: Prevents auto-refetch on page revisits
+    dedupingInterval: 600000, // 10 minutes dedupe
+    errorRetryCount: 3,
+    keepPreviousData: false,
+    revalidateOnMount: true,
+    errorRetryInterval: 2000,
+    onErrorRetry: (err, key, config, revalidate, { retryCount }) => {
+      // Do NOT retry if backend is down, overloaded, or unauthorized
+      if (
+        (err as any)?.code === 'BACKEND_DOWN' ||
+        (err as any)?.status === 0 ||
+        err instanceof ServerOverloadError ||
+        (err as any)?.status === 404 ||
+        (err as any)?.status === 401 // STOPS 401 LOOP
+      ) {
+        setRetriesExhausted(true);
+        return;
+      }
+      if (err instanceof RateLimitError) {
+        setRetriesExhausted(true);
+        return;
+      }
+      if (retryCount >= 3) {
+        setRetriesExhausted(true);
+        return;
+      }
+      if ((err as any)?.status >= 500) {
+        if (retryCount < 1) {
+          setTimeout(() => revalidate({ retryCount }), config.errorRetryInterval);
+        } else {
+          setRetriesExhausted(true);
+        }
+        return;
+      }
+      setTimeout(() => revalidate({ retryCount }), config.errorRetryInterval);
+    },
+    ...options,
+  });
+
+  const retry = useCallback(async () => {
+    setRetriesExhausted(false);
+    await mutate();
+  }, [mutate]);
+
+  return {
+    data,
+    loading: !data && !error,
+    error,
+    retry,
+     mutate, 
+    isRetrying: isValidating && !data,
+    retriesExhausted,
+    isValidating,  
+  };
+}
+
+export function useAdminGETSWR<T>(
+  endpoint: string,
+  options?: { manual?: boolean; [key: string]: any }
+) {
+  const [retriesExhausted, setRetriesExhausted] = useState(false);
+  const { manual, ...rest } = options || {};
+
+  const swrOptions: any = {
+    revalidateOnFocus: false,
+    revalidateIfStale: false,
+    revalidateOnMount: manual ? false : true,
+    dedupingInterval: 600000,
+    errorRetryCount: 3,
+    errorRetryInterval: 2000,
+    onErrorRetry: (err, key, config, revalidate, { retryCount }) => {
+      if (
+        err instanceof RateLimitError ||
+        (err as any)?.status === 0 ||
+        err instanceof ServerOverloadError ||
+        (err as any)?.code === 'BACKEND_DOWN' ||
+        (err as any)?.status === 404 ||
+        (err as any)?.status === 401
+      ) {
+        setRetriesExhausted(true);
+        return;
+      }
+      if (retryCount >= 3) {
+        setRetriesExhausted(true);
+        return;
+      }
+      if ((err as any)?.status >= 500) {
+        if (retryCount < 1) {
+          setTimeout(() => revalidate({ retryCount }), config.errorRetryInterval);
+        } else {
+          setRetriesExhausted(true);
+        }
+        return;
+      }
+      setTimeout(() => revalidate({ retryCount }), config.errorRetryInterval);
+    },
+    ...rest,   // ← THIS is the fix – passes refreshInterval, dedupingInterval etc.
+  };
+
+  const { data, error, mutate, isValidating } = useSWR<T>(endpoint, adminFetcher, swrOptions);
+
+  const refresh = useCallback(() => {
+    mutate();
+  }, [mutate]);
+
+  const retry = useCallback(async () => {
+    setRetriesExhausted(false);
+    await mutate();
+  }, [mutate]);
+
+  return {
+    data,
+    loading: !data && !error,
+    error,
+    refresh,
+    retry,
+    mutate,
+    isRetrying: isValidating && !data,
+    retriesExhausted,
+    isValidating,
+  };
+}
+
+========================================
+
+FILE: frontend\app\[locale]\(auth)\login\LoginPageClient.tsx (NOT FOUND)
+
+========================================
+
+
+========================================
+
+FILE: frontend\app\[locale]\(auth)\verify-2fa\Verify2FAPageClient.tsx (NOT FOUND)
+
+========================================
+
+
+========================================
+
+FILE: frontend\app\[locale]\(auth)\layout.tsx (NOT FOUND)
+
+========================================
+
+
+========================================
+
+FILE: frontend\app\admin\layout.tsx
+
+========================================
+
+// app/admin/layout.tsx
+import { ErrorHandler } from '@/components/providers/ErrorHandler';
+import AdminSidebar from '@/components/admin/AdminSidebar';
+import { LockScreen } from '@/components/admin/LockScreen';
+import { LockScreenProvider } from '@/components/providers/LockScreenProvider';
+import { AdminTopBar } from '@/components/admin/AdminTopBar';
+import AdminI18nProvider from './AdminI18nProvider';
+import { SessionProvider } from '@/components/providers/SessionProvider';
+
+export default function AdminLayout({ children }: { children: React.ReactNode }) {
+  return (
+
+    <AdminI18nProvider>
+              <SessionProvider>
+
+      <ErrorHandler>
+        <LockScreenProvider>
+          <div className="min-h-screen bg-gray-50 flex">
+            <LockScreen />
+            <AdminSidebar />
+            <main className="flex-1 flex flex-col min-w-0">
+              <AdminTopBar />
+              <div className="p-8 flex-1 overflow-x-auto">
+                {children}
+              </div>
+            </main>
+          </div>
+        </LockScreenProvider>
+      </ErrorHandler>
+              </SessionProvider>
+
+    </AdminI18nProvider>
+
+  );
+}
+
+========================================
+
+FILE: frontend\app\[locale]\layout.tsx (NOT FOUND)
+
+========================================
+
+
+========================================
+
+FILE: frontend\components\providers\TailscaleGateProvider.tsx
+
+========================================
+
+'use client';
+import { createContext, useContext, useEffect, useRef, useState } from 'react';
+import { usePathname, useRouter } from 'next/navigation';
+
+const TailscaleContext = createContext<{ healthy: boolean }>({ healthy: true });
+export const useTailscaleHealth = () => useContext(TailscaleContext);
+
+export function TailscaleGateProvider({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  const router = useRouter();
+  const [healthy, setHealthy] = useState(true);
+  const checkedRef = useRef(false);
+
+  const isProtectedPage =
+    pathname?.startsWith('/admin') ||
+    pathname?.includes('/login') ||
+    pathname?.includes('/forgot-password') ||
+    pathname?.includes('/reset-password') ||
+    pathname?.includes('/verify-2fa');
+
+  useEffect(() => {
+    if (!isProtectedPage) return;
+
+    const checkTailscale = async () => {
+      try {
+        const res = await fetch('/api/admin/health', { credentials: 'omit' });
+        const ok = res.ok;
+        setHealthy(ok);
+        if (!ok) router.replace('/404');
+      } catch {
+        setHealthy(false);
+        router.replace('/404');
+      }
+    };
+
+    // Fetch only on the very first mount (strict‑mode guard)
+    if (!checkedRef.current) {
+      checkedRef.current = true;
+      checkTailscale();
+    }
+
+    // Periodic recheck
+    const interval = setInterval(checkTailscale, 2 * 60 * 1000);
+    const onFocus = () => { if (document.visibilityState === 'visible') checkTailscale(); };
+    document.addEventListener('visibilitychange', onFocus);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [isProtectedPage, pathname, router]);
+
+  return (
+    <TailscaleContext.Provider value={{ healthy }}>
+      {children}
+    </TailscaleContext.Provider>
+  );
+}
+
+========================================
+
+FILE: frontend\components\admin\TailscaleStatus.tsx
+
+========================================
+
+'use client';
+import { useEffect, useState, useRef } from 'react';
+import { Wifi, WifiOff, Loader2, Copy, Check } from 'lucide-react';
+import { adminAPI } from '@/lib/api/client';
+import { useTailscaleHealth } from '@/components/providers/TailscaleGateProvider';
+import { Button } from '@/components/ui/button';
+import { toast } from 'sonner';
+
+export function TailscaleStatus({ collapsed = false }: { collapsed?: boolean }) {
+  const [connected, setConnected] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [tailscaleIp, setTailscaleIp] = useState<string | null>(null);
+  const [ipLoading, setIpLoading] = useState(true);
+  const [hoverOpen, setHoverOpen] = useState(false);
+  const { healthy } = useTailscaleHealth();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Connection status
+  useEffect(() => {
+    adminAPI('/health')
+      .then(() => setConnected(true))
+      .catch(() => setConnected(false))
+      .finally(() => setLoading(false));
+  }, []);
+
+  // Tailscale IP
+  useEffect(() => {
+    adminAPI<{ user: { tailscaleIp?: string } }>('/auth/me')
+      .then((data) => setTailscaleIp(data.user?.tailscaleIp || null))
+      .catch(() => setTailscaleIp(null))
+      .finally(() => setIpLoading(false));
+  }, []);
+
+  const copyIp = () => {
+    if (tailscaleIp) {
+      navigator.clipboard.writeText(tailscaleIp);
+      toast.success('IP copied');
+    }
+  };
+
+  if (loading || ipLoading) return <Loader2 className="w-4 h-4 animate-spin text-gray-400" />;
+  if (healthy === null) return null;
+
+  return (
+    <div className="relative inline-block">
+      <button
+        ref={triggerRef}
+        className="p-1 hover:bg-gray-100 rounded"
+        onMouseEnter={() => setHoverOpen(true)}
+        onMouseLeave={() => setHoverOpen(false)}
+      >
+        {healthy ? (
+          <Wifi className="w-4 h-4 text-green-400" />
+        ) : (
+          <WifiOff className="w-4 h-4 text-red-400" />
+        )}
+      </button>
+
+      {hoverOpen && (
+        <div
+          ref={panelRef}
+          className="absolute right-0 top-full mt-1 z-50 w-56 p-3 text-sm bg-white border border-gray-200 shadow-lg rounded-md"
+          onMouseEnter={() => setHoverOpen(true)}
+          onMouseLeave={() => setHoverOpen(false)}
+        >
+          <p className="font-medium mb-1">
+            {healthy ? 'Tailscale Connected' : 'Tailscale Disconnected'}
+          </p>
+          {tailscaleIp ? (
+            <div className="flex items-center justify-between gap-1 text-gray-500">
+              <span className="font-mono">{tailscaleIp}</span>
+              <Button variant="ghost" size="icon" className="h-6 w-6" onClick={copyIp}>
+                <Copy className="w-3 h-3" />
+              </Button>
+            </div>
+          ) : (
+            <p className="text-xs text-gray-400">IP unavailable</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+========================================
+
+FILE: frontend\lib\hooks\useGeoLocation.ts
+
+========================================
+
+const GEO_CACHE_KEY = 'geo_data_v2';
+const GEO_IP_KEY = 'geo_ip_v2';
+const TTL = 30 * 60 * 1000;
+   const PUBLIC_API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
+
+interface GeoData {
+  country?: string;
+  city?: string;
+  lat?: number;
+  lon?: number;
+  timezone?: string;
+}
+
+let inMemoryGeo: GeoData | null = null;
+
+export async function getCachedGeo(): Promise<GeoData | null> {
+  if (inMemoryGeo) return inMemoryGeo;
+  try {
+    const cached = localStorage.getItem(GEO_CACHE_KEY);
+    const cachedIP = localStorage.getItem(GEO_IP_KEY);
+    if (cached) {
+      const { data, timestamp, ip } = JSON.parse(cached);
+      if (Date.now() - timestamp < TTL && ip === cachedIP) {
+        inMemoryGeo = data;
+        return data;
+      }
+    }
+  } catch {}
+  try {
+const res = await fetch(`${PUBLIC_API_URL}/api/public/geo-lookup`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const geo: GeoData = {
+      country: data.country,
+      city: data.city,
+      lat: data.lat,
+      lon: data.lon,
+      timezone: data.timezone,
+    };
+    inMemoryGeo = geo;
+    localStorage.setItem(GEO_CACHE_KEY, JSON.stringify({
+      data: geo,
+      timestamp: Date.now(),
+      ip: data.ip,
+    }));
+    localStorage.setItem(GEO_IP_KEY, data.ip);
+    return geo;
+  } catch {
+    return null;
+  }
+}
+
+========================================
+
+FILE: frontend\lib\api\rate-limit-cache.ts
+
+========================================
+
+interface RateLimitEntry {
+  expiresAt: number;   // timestamp when cooldown ends
+}
+
+const cache = new Map<string, RateLimitEntry>();
+
+/**
+ * Call this after receiving a RateLimitError.
+ * Saves the endpoint + retryAfter so we can block subsequent calls.
+ */
+export function setRateLimit(endpoint: string, retryAfterSeconds: number) {
+  cache.set(endpoint, {
+    expiresAt: Date.now() + retryAfterSeconds * 1000,
+  });
+}
+
+/**
+ * Check if an endpoint is currently blocked.
+ * Returns the remaining seconds if blocked, otherwise null.
+ */
+export function getRateLimitCooldown(endpoint: string): number | null {
+  const entry = cache.get(endpoint);
+  if (!entry) return null;
+  const remaining = Math.ceil((entry.expiresAt - Date.now()) / 1000);
+  return remaining > 0 ? remaining : null;
+}
+
+/**
+ * Clear a cached rate limit (e.g., after a successful request).
+ */
+export function clearRateLimit(endpoint: string) {
+  cache.delete(endpoint);
+}
+
+========================================
+
+FILE: backend\src\routes\admin\monitor.ts
+
+========================================
+
+import { Router } from 'express';
+import { authenticate, requireAdmin, csrfProtection } from '../../middleware/auth.js';
+import { verifyDeleteCode } from '../../middleware/delete-code.js';
+import { createRateLimiter } from '../../middleware/rate-limit.js';
+import { supabase } from '../../lib/supabase.js';
+import { logAudit } from '../../lib/audit.js';
+import { sendEmail, sendTelegram } from '../../services/notification-service.js';
+import { revokeAllUserTokens } from '../../services/token-service.js';
+const router = Router();
+const limiter = createRateLimiter({ windowMs: 60_000, maxRequests: 30, keyPrefix: 'ratelimit:admin:monitor' });
+router.use(limiter);
+
+// ── Helpers ──────────────────────────────────────────────────────
+function parsePagination(req) {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 5000);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  return { limit, offset };
+}
+// Reuses the same delete-code validation for full-data requests
+function requireVerificationForFullData(req, res, next) {
+  const limit = Number(req.query.limit) || 20;
+  const isFull = req.query.full === 'true' || limit > 50;
+
+  if (!isFull) return next();   // normal paginated request – no code needed
+
+  // Transfer the query param to the body so verifyDeleteCode can process it
+  req.body = req.body || {};
+  req.body.deleteCode = req.query.deleteCode;
+
+  // Delegate to the existing middleware
+  verifyDeleteCode(req, res, next);
+}
+// ── AUDIT LOGS ───────────────────────────────────────────────────
+router.get('/audit-logs', authenticate, requireAdmin, requireVerificationForFullData, async (req, res) => {
+  const { limit, offset } = parsePagination(req);
+  const { search, success, dateFrom, dateTo } = req.query;
+  let query = supabase
+    .from('AuditLog')
+    .select(
+      'id, userId, action, resource, resourceId, ipAddress, userAgent, tailscaleIp, deviceFingerprint, success, errorMessage, metadata, createdAt',
+      { count: 'exact' }
+    )
+    .order('createdAt', { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  // Search across text columns that actually exist
+ if (search) {
+  const term = `%${search}%`;
+  query = query.or(
+    `action.ilike.${term},resource.ilike.${term},ipAddress.ilike.${term},userAgent.ilike.${term},errorMessage.ilike.${term}`
+  );
+}
+  // Success filter
+  if (success === 'true') query = query.eq('success', true);
+  else if (success === 'false') query = query.eq('success', false);
+
+  // Safe date filters
+  if (dateFrom) {
+    const d = new Date(dateFrom);
+    if (!isNaN(d.getTime())) query = query.gte('createdAt', d.toISOString());
+  }
+  if (dateTo) {
+    const d = new Date(dateTo);
+    if (!isNaN(d.getTime())) query = query.lte('createdAt', d.toISOString());
+  }
+
+  const { data, error, count } = await query;
+if (error) {
+  return res.status(500).json({ error: 'Operation failed' });
+}
+  await logAudit({
+    userId: req.user.id,
+    action: 'LIST',
+    resource: 'AuditLog',
+    req,
+    success: true,
+    metadata: { count },
+  });
+  res.json({ items: data, total: count });
+});
+// ── ACTIVE SESSIONS ──────────────────────────────────────────────
+router.get('/sessions', authenticate, requireAdmin, async (req, res) => {
+  const { limit, offset } = parsePagination(req);
+  const now = new Date().toISOString();
+
+  const { data, error, count } = await supabase
+    .from('Session')
+    .select(
+      'id, userId, deviceFingerprint, ipAddress, geoLocation, userAgent, createdAt, expiresAt, user:User(email)',
+      { count: 'exact' }
+    )
+    .gt('expiresAt', now)
+    .order('createdAt', { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (error) return res.status(500).json({ error: 'Operation failed' });
+
+  await logAudit({ userId: req.user.id, action: 'LIST', resource: 'Session', req, success: true, metadata: { count } });
+  res.json({ items: data, total: count });
+});
+
+// ── REVOKE SESSION ──────────────────────────────────────────────
+router.delete('/sessions/:id', authenticate, requireAdmin, csrfProtection, verifyDeleteCode, async (req, res) => {
+  const { data: session } = await supabase
+    .from('Session')
+    .select('id, userId')
+    .eq('id', req.params.id)
+    .maybeSingle();
+
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
+  // Delete from Redis (best-effort)
+  try {
+    const { default: redis } = await import('../../lib/redis.js');
+    await redis.del(`session:${req.params.id}`);
+  } catch {}
+
+await supabase.from('Session').delete().eq('id', req.params.id);
+
+// Revoke all refresh tokens for this user so they can't silently recover
+await revokeAllUserTokens(session.userId);
+  logAudit({ userId: req.user.id, action: 'REVOKE_SESSION', resource: 'Session', resourceId: req.params.id, req, success: true });
+  res.json({ success: true });
+});
+
+// ── NOTIFICATIONS STATUS ────────────────────────────────────────
+router.get('/notifications/status', authenticate, requireAdmin, async (req, res) => {
+  const status = {
+    emailConfigured: !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
+    telegramConfigured: !!(process.env.TELEGRAM_BOT_TOKEN && process.env.ADMIN_TELEGRAM_CHAT_ID),
+  };
+
+  // Get queue counts
+  try {
+    const { emailQueue, telegramQueue } = await import('../../lib/queue.js');
+    const emailCounts = await emailQueue.getJobCounts();
+    const telegramCounts = await telegramQueue.getJobCounts();
+    status.emailQueue = emailCounts;
+    status.telegramQueue = telegramCounts;
+  } catch (err) {
+    status.queueError = 'Could not retrieve queue stats';
+  }
+
+  await logAudit({ userId: req.user.id, action: 'VIEW', resource: 'NotificationStatus', req, success: true });
+  res.json(status);
+});
+
+// ── SEND TEST NOTIFICATION ──────────────────────────────────────
+router.post('/notifications/test', authenticate, requireAdmin, csrfProtection, verifyDeleteCode, async (req, res) => {
+  const { email, telegram } = req.body; // optional, fallback to admin's own
+  const adminEmail = email || req.user.email;
+  const adminChatId = process.env.ADMIN_TELEGRAM_CHAT_ID;
+
+  try {
+    await sendEmail(adminEmail, 'Test Notification', 'welcome', { name: 'Admin' });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to send test email' });
+  }
+
+  try {
+    if (adminChatId) {
+      await sendTelegram(adminChatId, `🔔 Test notification from Monitor panel\nAdmin: ${req.user.email}\nTime: ${new Date().toISOString()}`);
+    }
+  } catch (err) {
+    // Telegram failure is not critical
+  }
+
+  logAudit({ userId: req.user.id, action: 'TEST_NOTIFICATION', resource: 'Notification', req, success: true });
+  res.json({ success: true });
+});
+
+export default router;
