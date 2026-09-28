@@ -1,0 +1,476 @@
+{
+  "cookieConsent": {
+    "message": "نحن نستخدم ملفات تعريف الارتباط لتحسين تجربتك.",
+    "refuse": "رفض",
+    "accept": "قبول",
+        "cookie_consent": "ملفات تعريف الارتباط"
+
+  },
+  "navigation": {
+    "home": "الرئيسية",
+    "about": "من نحن",
+    "services": "الخدمات",
+    "gallery": "المعرض",
+    "store": "المتجر",
+    "booking": "الحجز",
+    "contact": "اتصل بنا",
+    "cart": "السلة",
+    "profile": "الملف الشخصي" ,
+    "languageFr": "Français",
+"languageAr": "العربية",
+"switchLang": "تغيير اللغة"
+  },
+  "home": {
+    "bookNow": "احجز الآن",
+    "contactUs": "اتصل بنا",
+    "fallbackTitle": "لا يوجد محتوى",
+ 
+    "fallback": {
+  "titlePrefix": "استكشف عالمًا من",
+  "titleSuffix": "بعد المدرسة",
+  "exploreMore": "استكشف المزيد"
+},
+"middleSection": {
+    "title": "شاهد أطفالك يزدهرون وهم يتعلمون ويستمتعون",
+    "description": "من السباحة والتزلج إلى الشطرنج والموسيقى، تساعد برامجنا بعد المدرسة الأطفال على بناء الثقة وتكوين الصداقات واكتشاف شغف جديد كل يوم.",
+    "badgeLabel": "مهمتنا",
+    "badgeText": "كل طفل يستحق مساحة آمنة ومبهجة للعب والتعلم والنمو — نحن نصنع تلك المساحة."
+  } , 
+"fallbackSubtitle": "المشاركة في الأنشطة بعد المدرسة مثل السباحة والتزلج والرياضة تقدم فوائد عديدة للأطفال."
+ ,
+ "whyChooseUs": {
+ "title": "لماذا تختارنا؟",
+  "selectTab": "اختر تبويباً"
+} , 
+    "cta": {
+      "title": "مستعد للبدء؟",
+      "subtitle": "سجل طفلك اليوم واكتشف عالمًا من التعلم الممتع",
+      "bookNow": "احجز الآن",
+      "contactUs": "اتصل بنا"
+    }
+  },
+  "about": {
+    "title": "من نحن",
+    "description": "اكتشف مهمتنا وفريقنا" , 
+    "emptyTitle": "قريباً",
+    "emptyDescription": "صفحة 'من نحن' قيد الإنشاء.",
+    "learnMore": "اعرف المزيد"
+  },
+  "services": {
+    "title": "خدماتنا",
+    "description": "اكتشف جميع أنشطتنا للأطفال",
+    "learnMore": "اقرأ المزيد", 
+    "viewAll": "عرض جميع الخدمات" , 
+    "subtitle": "اكتشف جميع أنشطتنا للأطفال",
+    "pageTitle": "خدماتنا",
+    "pageSubtitle": "اختر ما يناسب طفلك",
+    "empty": "لا توجد خدمات متاحة حالياً"
+  },
+  "keyFigures": {
+  "title": "تأثيرنا",
+  "subtitle": "أرقام تتحدث عن نفسها"
+} ,
+ "goals": {
+  "target": "الهدف : {value}",
+  "title": "أهدافنا",
+  "subtitle": "تابع تقدمنا في الوقت الفعلي"
+} , 
+"siteImages": {
+  "fallbackAlt": "صورة مؤقتة"
+} , 
+  "brands": {
+        "logoAlt": "شعار الشريك",  
+    "title": "يثقون بنا",
+    "subtitle": "شركاء معترف بهم يدعمون مهمتنا",
+    "visitSite": "زيارة الموقع"
+  },
+  "faq": {
+  "title": "الأسئلة الشائعة"
+} , 
+ "bookPanel": {
+  "title": "احجز نشاطك",
+  "encouragement": "مغامرة لا تنسى تبدأ هنا",
+  "selectService": "اختر نشاطًا",
+  "name": "اسمك",
+  "namePlaceholder": "جان دوبون",
+  "location": "العنوان",
+  "locationPlaceholder": "تونس، تونس",
+  "bookNow": "احجز الآن"
+},
+  "booking": {
+    "title": "احجز فعاليتك",
+    "subtitle": "املأ التفاصيل أدناه لجدولة فعاليتك",
+    "location": "الموقع",
+    "name": "الاسم",
+    "service": "الخدمة",
+    "form": {
+      "bookingType": "نوع الحجز",
+      "privateOption": "خاص",
+      "publicOption": "عام",
+          "phonePlaceholder": "رقم هاتفك", 
+      "serviceType": "نوع الخدمة",
+      "selectPlaceholder": "اختر",
+      "customService": "خدمة مخصصة",
+      "childrenCount": "عدد الأطفال",
+      "eventName": "اسم الفعالية (اختياري)",
+      "description": "الوصف (اختياري)",
+      "image": "تحميل صورة (اختياري)",
+      "name": "الاسم الكامل",
+      "email": "البريد الإلكتروني",
+      "phone": "رقم الهاتف",
+      "location": "الموقع",
+      "notes": "ملاحظات إضافية (اختياري)",
+      "next": "التالي",
+      "clickToUpload": "انقر لتحميل صورة",
+      "success": "تم تأكيد الحجز!",
+      "sessionExpired": "انتهت الجلسة. يرجى البدء من جديد.",
+      "error": "حدث خطأ ما. يرجى المحاولة مرة أخرى.",
+      "rateLimit": "طلبات كثيرة. حاول مرة أخرى لاحقاً.",
+      "errors": {
+        "serviceType": "الرجاء اختيار نوع الخدمة",
+        "name": "يجب أن يحتوي الاسم على حرفين على الأقل",
+        "email": "بريد إلكتروني غير صالح",
+        "phone": "رقم هاتف غير صالح",
+        "phoneValid": "يجب أن يكون رقم الهاتف صالحاً",
+        "location": "الموقع مطلوب",
+        "nameInvalid": "الاسم يحتوي على أحرف غير صالحة",
+        "emailInvalid": "صيغة البريد الإلكتروني غير صالحة"
+      }
+    },
+    "calendar": {
+      "back": "رجوع",
+      "title": "اختر موعداً",
+      "instructions": "اختر التاريخ والوقت المناسبين لك",
+      "loading": "جاري تحميل التقويم...",
+      "loadError": "تعذر تحميل التقويم. يرجى المحاولة مرة أخرى.",
+      "retry": "إعادة المحاولة"
+    },
+    "info": {
+      "needChanges": "هل تحتاج إلى إجراء تغييرات لاحقاً؟",
+      "afterBooking": "بعد الحجز، ستتلقى رسالة تأكيد بالبريد الإلكتروني. استخدم الروابط الموجودة بداخلها لـ",
+      "reschedule": "إعادة الجدولة",
+      "cancel": "إلغاء",
+      "appointment": "موعدك في أي وقت."
+    },
+    "common": { "or": "أو" }
+  },
+  "cart": {
+    "title": "سلة المشتريات",
+    "checkoutTitle": "إتمام الطلب",
+    "empty": "السلة فارغة",
+    "continueShopping": "متابعة التسوق",
+    "total": "المجموع",
+    "checkout": "الدفع",
+    "orderSuccess": "تم تقديم الطلب بنجاح",
+    "form": {
+      "name": "الاسم الكامل",
+      "email": "البريد الإلكتروني",
+      "phone": "الهاتف",
+          "phonePlaceholder": "رقم هاتفك", 
+           "namePlaceholder": "الاسم الكامل",
+    "emailPlaceholder": "example@email.com",
+    "addressPlaceholder": "تونس، تونس",
+    "notesPlaceholder": "ملاحظاتك..." ,
+      "address": "العنوان",
+      "notes": "ملاحظات",
+      "submitting": "جاري التقديم...",
+      "placeOrder": "تقديم الطلب",
+      "error": "حدث خطأ أثناء معالجة الطلب",
+      "rateLimit": "محاولات كثيرة. حاول لاحقاً.",
+      "errors": {
+        "nameMin": "الاسم قصير جداً",
+        "emailInvalid": "بريد إلكتروني غير صالح",
+        "phoneRequired": "رقم الهاتف مطلوب",
+        "phoneInvalid": "رقم هاتف غير صالح",
+        "addressMin": "العنوان قصير جداً"
+      }
+    }
+  },
+  "contact": {
+    "title": "اتصل بنا",
+    "description": "نحن هنا للإجابة على أسئلتكم", 
+    "subtitle": "نحن هنا للإجابة على أسئلتكم",
+    "form": {
+      "nameplaceholder": "اسمك",
+      "emailplaceholder": "بريدك الإلكتروني",
+      "phonePlaceholder": "هاتفك",
+      "messageplaceholder": "رسالتك",
+      "customSubjectRequired": "الرجاء تحديد موضوعك" , 
+      "name": "الاسم الكامل",
+    "email": "البريد الإلكتروني",
+    "phone": "رقم الهاتف",
+   "subject": "الموضوع",
+"subjectPlaceholder": "اختر موضوعاً",
+"customSubject": "موضوعك",
+"customSubjectPlaceholder": "حدد موضوعك",
+"subjectRequired": "الرجاء اختيار موضوع",
+"noSubjectTitle": "بدون عنوان", 
+    "message": "الرسالة" ,
+      "submit": "إرسال",
+      "sending": "جاري الإرسال...",
+      "success": "تم إرسال الرسالة!",
+      "error": "خطأ أثناء الإرسال",
+      "rateLimit": "طلبات كثيرة. يرجى الانتظار.",
+      "errors": {
+        "nameMin": "يجب أن يحتوي الاسم على حرفين على الأقل",
+        "emailInvalid": "بريد إلكتروني غير صالح",
+        "phoneInvalid": "رقم هاتف غير صالح",
+        "messageMin": "يجب أن تحتوي الرسالة على 10 أحرف على الأقل",
+        "contactMethod": "يرجى تقديم بريد إلكتروني أو هاتف"
+      }
+    },
+    "info": {
+      "title": "معلومات الاتصال",
+      "addressLabel": "العنوان",
+      "emailLabel": "البريد الإلكتروني",
+      "phoneLabel": "الهاتف",
+      "hoursLabel": "ساعات العمل"
+    },
+    "schedule": {
+      "summaryFallback": "أوقات العمل غير متوفرة",
+      "closed": "مغلق",
+      "noInfo": "لا توجد معلومات عن أوقات العمل"
+    }
+  },
+  "contactSection": {
+    "title": "اتصل بنا",
+    "subtitle": "هل لديك سؤال؟ فريقنا هنا للرد عليك.",
+    "form": {
+      "nameplaceholder": "اسمك",
+      "emailplaceholder": "بريدك الإلكتروني",
+      "phonePlaceholder": "هاتفك",
+      "messageplaceholder": "رسالتك",
+      "customSubjectRequired": "الرجاء تحديد موضوعك" ,
+      "name": "الاسم الكامل",
+    "email": "البريد الإلكتروني",
+    "phone": "رقم الهاتف",
+    "message": "الرسالة" , 
+      "submit": "إرسال",
+"subject": "الموضوع",
+"subjectPlaceholder": "اختر موضوعاً",
+"customSubject": "موضوعك",
+"customSubjectPlaceholder": "حدد موضوعك",
+"subjectRequired": "الرجاء اختيار موضوع",
+"noSubjectTitle": "بدون عنوان", 
+      "sending": "جاري الإرسال...",
+      "success": "تم الإرسال!",
+      "error": "خطأ، يرجى المحاولة مرة أخرى.",
+      "rateLimit": "طلبات كثيرة. يرجى الانتظار.",
+      "errors": {
+        "nameMin": "الاسم مطلوب (حد أدنى حرفين)",
+        "emailInvalid": "بريد إلكتروني غير صالح",
+        "phoneInvalid": "رقم هاتف غير صالح",
+        "messageMin": "الرسالة قصيرة جداً (10 أحرف على الأقل)",
+        "contactMethod": "البريد الإلكتروني أو الهاتف مطلوب"
+      }
+    },
+    "info": { "title": "معلومات الاتصال" }
+  },
+  "store": {
+    "title": "المتجر",
+    "limited": "محدود",
+"loadMore": "تحميل المزيد",
+"limited": "محدود" ,
+    "featuredTitle": "منتجات مميزة",
+    "featuredSubtitle": "اكتشف منتجاتنا المختارة",
+    "viewAll": "عرض الكل",
+    "noImage": "لا توجد صورة",
+    "searchPlaceholder": "ابحث عن منتج...",
+    "allCategories": "جميع الفئات",
+    "sortBy": "ترتيب حسب",
+    "newest": "الأحدث",
+    "priceAsc": "السعر من الأقل إلى الأعلى",
+    "priceDesc": "السعر من الأعلى إلى الأقل",
+    "nameAsc": "الاسم من أ-ي",
+    "nameDesc": "الاسم من ي-أ",
+    "noProducts": "لا توجد منتجات",
+    "category": "الفئة",
+    "search": "بحث",
+    "sort": "ترتيب"
+  },
+  "productDetail": {
+      "title": "تفاصيل المنتج",
+                  "productnotfound": "هذا المنتج لم يعد موجوداً أو تم سحبه.",
+                  "addToCart": "أضف إلى السلة" ,
+  "description": "اكتشف تفاصيل هذا المنتج",
+    "notFound": "المنتج غير موجود",
+    "backToStore": "العودة للمتجر",
+    "noImage": "لا توجد صورة",
+    "addToCart": "أضف إلى السلة",
+    "stock": "{count} متوفر"
+  },
+  "gallery": {
+    "title": "معرض الصور",
+    "allSub": "الكل",
+"loadMore": "تحميل المزيد", 
+    "description": "تصفح أبرز لحظات أنشطتنا",
+    "subtitle": "لحظات من أنشطتنا",
+    "viewAll": "عرض الكل",
+    "all": "الكل",
+    "empty": "لا توجد صور حالياً"
+  },
+  "terms": {
+    "title": "معلومات قانونية",
+    "tab": "لسان",
+    "tab_terms": "شروط الخدمة",
+    "tab_privacy": "سياسة الخصوصية",
+    "tab_conditions": "الأحكام والشروط",
+    "empty": "لا يوجد محتوى بعد.",
+    "emptyTitle": "سيتم توفير الشروط والأحكام قريباً.",
+    "emptyDescription": "شروطنا وأحكامنا قيد الصياغة. تفضل بزيارتنا قريباً!"
+  },
+  "footer": {
+    "home": "الرئيسية",
+    "about": "من نحن",
+    "services": "خدمات",
+    "booking": "حجز",
+    "store": "متجر",
+    "contact": "اتصل بنا",
+    "gallery": "معرض",
+    "followUs": "تابعنا",
+    "copyright": "© 2026-{years}. جميع الحقوق محفوظة",
+    "newsletter": {
+      "title": "ابق على اطلاع",
+          "phonePlaceholder": "رقم هاتفك", 
+      "subtitle": "احصل على آخر الأخبار والعروض الخاصة.",
+      "emailPlaceholder": "بريدك@email.com",
+      "subscribe": "اشتراك",
+      "subscribing": "جاري...",
+      "success": "شكراً! تم الاشتراك.",
+      "alreadySubscribed": "أنت مشترك بالفعل.",
+      "error": "خطأ، حاول مرة أخرى.",
+      "addPhone": "أضف هاتف",
+      "removePhone": "إزالة الهاتف",
+      "invalidEmail": "بريد إلكتروني غير صالح",
+      "invalidPhone": "رقم هاتف غير صالح",
+      "contactRequired": "يرجى إدخال بريد إلكتروني أو هاتف",
+      "rateLimit": "طلبات كثيرة. حاول لاحقاً."
+    },
+    "tab_terms": "شروط الخدمة",
+    "tab_privacy": "سياسة الخصوصية",
+    "tab_conditions": "الأحكام والشروط"
+  },
+  "notFound": {
+    "title": "الصفحة غير موجودة",
+    "description": "عذراً! الصفحة التي تبحث عنها غير موجودة أو تم نقلها.",
+    "returnHome": "العودة للرئيسية"
+  },
+  "error": {
+    "title": "الموقع تحت الصيانة",
+    "message": "نعمل حالياً على تحسين تجربتك. يرجى المحاولة مرة أخرى بعد قليل.",
+    "tryAgain": "إعادة المحاولة"
+  },
+  "common": {
+    "error": {
+      "title": "عذراً!",
+      "unauthorized": "انتهت الجلسة. يُرجى تسجيل الدخول مرة أخرى.",
+      "network": "لا يوجد اتصال بالإنترنت. تحقق من شبكتك.",
+      "server": "خطأ في الخادم. فريقنا يعمل على إصلاحه.",
+      "overload": "طلبات كثيرة جدًا – خدمتنا تشهد إقبالًا كبيرًا حاليًا. يرجى المحاولة مرة أخرى بعد قليل.",
+      "down": "الخدمة غير متاحة مؤقتًا. يرجى المحاولة لاحقًا.",
+      "default": "حدث خطأ غير متوقع.",
+      "generic": "فشل التحميل. إعادة المحاولة؟",
+      "rateLimit": "تم تجاوز الحد المسموح. حاول لاحقاً."
+    },
+    "connectionRestored": "تمت استعادة الاتصال" , 
+    "retry": "إعادة المحاولة",
+    "retrying": "جاري إعادة المحاولة...",
+    "offline": "غير متصل - قد تكون بعض الميزات محدودة",
+    "sessionExpired": "انتهت الجلسة",
+    "pleaseLoginAgain": "يرجى تسجيل الدخول مرة أخرى"
+  },
+  "auth": {
+    "login": {
+      "title": "تسجيل دخول المشرف",
+      "subtitle": "الوصول إلى لوحة التحكم",
+      "email": "البريد الإلكتروني",
+      "password": "كلمة المرور",
+      "signIn": "تسجيل الدخول",
+      "signingIn": "جاري تسجيل الدخول...",
+      "forgotPassword": "نسيت كلمة المرور؟",
+      "error": "البريد الإلكتروني أو كلمة المرور غير صحيحة"
+    },
+    "forgotPassword": {
+      "title": "نسيت كلمة المرور",
+      "subtitle": "سنرسل لك رمز إعادة التعيين",
+      "email": "البريد الإلكتروني",
+      "send": "إرسال الرمز",
+      "sending": "جاري الإرسال...",
+      "checkEmail": "تحقق من بريدك الإلكتروني",
+      "message": "تم إرسال رمز إعادة التعيين إلى <strong>{email}</strong>",
+      "continue": "متابعة",
+      "backToLogin": "العودة لتسجيل الدخول",
+      "error": "حدث خطأ. يرجى المحاولة مرة أخرى."
+    },
+    "resetPassword": {
+      "title": "إعادة تعيين كلمة المرور",
+      "subtitle": "أدخل الرمز المرسل إلى بريدك الإلكتروني",
+      "newPassword": "كلمة المرور الجديدة",
+      "confirmPassword": "تأكيد كلمة المرور",
+      "reset": "إعادة تعيين",
+      "resetting": "جاري إعادة التعيين...",
+      "success": "تم تغيير كلمة المرور!",
+      "successMessage": "تم إعادة تعيين كلمة المرور بنجاح.",
+      "goToLogin": "تسجيل الدخول",
+      "resend": "إعادة إرسال الرمز",
+      "sending": "جاري الإرسال...",
+      "newCodeSent": "تم إرسال رمز جديد!",
+      "backToRequest": "طلب رمز جديد",
+      "passwordMismatch": "كلمات المرور غير متطابقة",
+      "codeRequired": "الرمز مطلوب",
+      "error": "حدث خطأ",
+      "sessionExpired": "انتهت الجلسة. يرجى البدء من جديد.",
+      "sessionExpiresIn": "تنتهي الجلسة خلال",
+      "codeExpiresIn": "تنتهي صلاحية الرمز خلال {time}",
+      "codeExpired": "انتهت صلاحية الرمز. يمكنك طلب رمز جديد.",
+      "backToLogin": "العودة إلى تسجيل الدخول"
+    },
+    "twoFactor": {
+      "title": "التحقق بخطوتين",
+      "subtitle": "أدخل الرمز المرسل إلى بريدك الإلكتروني",
+      "verify": "تحقق",
+      "verifying": "جاري التحقق...",
+      "resend": "إعادة إرسال الرمز",
+      "sending": "جاري الإرسال...",
+      "newCodeSent": "تم إرسال رمز جديد!",
+      "error": "الرمز غير صحيح أو منتهي الصلاحية",
+      "sessionExpired": "انتهت الجلسة. يرجى إعادة تسجيل الدخول.",
+      "sessionExpiresIn": "تنتهي الجلسة خلال",
+      "codeExpiresIn": "تنتهي صلاحية الرمز خلال {time}",
+      "codeExpired": "انتهت صلاحية الرمز. يمكنك طلب رمز جديد.",
+      "backToLogin": "العودة إلى تسجيل الدخول",
+      "sessionId": "معرف الجلسة"
+    }
+  },
+  "reviews": {
+    "title": "آراء عملائنا",
+    "subtitle": "اكتشف تجارب عملائنا"
+  },
+  "goals": {
+      "target": "الهدف : {value}"
+ ,
+    "title": "إنجازاتنا",
+    "subtitle": "أهداف طموحة لسعادة أطفالكم"
+  },
+  "bookingSection": {
+    "title": "احجز نشاطك",
+    "subtitle": "اختر نشاطًا، اسمك والعنوان.",
+    "service": "النشاط",
+    "selectService": "اختر نشاطًا",
+    "name": "اسمك",
+    "namePlaceholder": "مثال: جان دوبون",
+    "location": "العنوان",
+    "locationPlaceholder": "مثال: تونس، تونس",
+    "button": "متابعة" , 
+       "persuasion": "في لحظات، امنح طفلك تجربة لا تُنسى. إلغاء مجاني حتى 24 ساعة قبل الموعد."
+  },
+  "admin": {
+    "about": {
+      "title": "تعديل صفحة من نحن",
+      "saved": "تم الحفظ بنجاح",
+      "error": "فشل الحفظ",
+      "saving": "جاري الحفظ...",
+      "save": "حفظ"
+    }
+  }
+}
