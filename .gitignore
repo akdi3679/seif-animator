@@ -51,3 +51,9 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+# TLS certs and secrets
+frontend/certs/
+*.pem
+*.key
+frontend/next-env.d.ts
+
